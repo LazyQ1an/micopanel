@@ -9,7 +9,10 @@ const schema = z.object({
   APP_ENCRYPTION_KEY: z.string().min(24).default("development-encryption-key-change-before-production"),
   BOOTSTRAP_USERNAME: z.string().min(3).max(32).default("admin"),
   BOOTSTRAP_PASSWORD: z.string().min(10).default("ChangeMe123!"),
-  CORS_ORIGIN: z.string().default("http://localhost:5173")
+  CORS_ORIGIN: z.string().default("http://localhost:5173"),
+  ARTIFACTS_DIR: z.string().default("./data/artifacts"),
+  ARTIFACT_MAX_BYTES: z.coerce.number().int().positive().max(2 * 1024 * 1024 * 1024).default(1024 * 1024 * 1024),
+  ARTIFACT_TOKEN_TTL_MINUTES: z.coerce.number().int().positive().max(1440).default(60)
 });
 
 export type AppConfig = z.infer<typeof schema>;
@@ -23,4 +26,3 @@ export const loadConfig = (): AppConfig => {
   }
   return config;
 };
-

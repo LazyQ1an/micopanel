@@ -1,7 +1,14 @@
 import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
+import multipart from "@fastify/multipart";
 import rateLimit from "@fastify/rate-limit";
 import websocket from "@fastify/websocket";
+import { createHash } from "node:crypto";
+import { createReadStream, createWriteStream } from "node:fs";
+import { mkdir, rm, stat } from "node:fs/promises";
+import { basename, extname, relative, resolve } from "node:path";
+import { Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import { Cron } from "croner";
 import {
@@ -35,7 +42,7 @@ import {
 } from "./service.js";
 import { createStore, type StateStore } from "./store.js";
 import { SERVER_TEMPLATES } from "./templates.js";
-import type { BackupRecord, InstanceRecord, ManagedFile, NodeRecord, ScheduleRecord, TaskRecord, User } from "./types.js";
+import type { ArtifactRecord, BackupRecord, InstanceRecord, ManagedFile, NodeRecord, ScheduleRecord, TaskRecord, User } from "./types.js";
 
 type SocketLike = {
   readyState: number;
@@ -93,6 +100,8 @@ const instanceSchema = z.object({
   diskMb: z.number().int().min(1024).max(10485760),
   pids: z.number().int().min(64).max(32768).default(512),
   port: z.number().int().min(1024).max(65535).optional(),
+  artifactId: z.string().uuid().optional(),
+  customJar: z.string().min(1).max(128).refine((value) => !value.includes("/") && !value.includes("\\") && value.endsWith(".jar"), "自定义入口 JAR 无效").optional(),
   environment: z.record(z.string().max(128)).default({}),
   eulaAccepted: z.literal(true)
 });
@@ -113,12 +122,14 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
   const config = options?.config ?? loadConfig();
   const store = options?.store ?? createStore(config.DATABASE_URL);
   await store.init();
+  await mkdir(config.ARTIFACTS_DIR, { recursive: true });
 
   const app = Fastify({ logger: config.NODE_ENV !== "test", bodyLimit: 10_500_000, trustProxy: config.NODE_ENV === "production" });
   const hub = new RealtimeHub();
   await app.register(cookie, { secret: config.SESSION_SECRET, hook: "onRequest" });
   await app.register(cors, { origin: config.CORS_ORIGIN, credentials: true });
   await app.register(rateLimit, { global: true, max: 180, timeWindow: "1 minute", skipOnError: true });
+  await app.register(multipart, { limits: { files: 1, fileSize: config.ARTIFACT_MAX_BYTES } });
   await app.register(websocket, { options: { maxPayload: 10_500_000 } });
 
   app.addHook("onSend", async (_request, reply, payload) => {
@@ -373,6 +384,20 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
 
   app.get("/api/templates", async () => ({ templates: SERVER_TEMPLATES }));
 
+  app.get("/api/agent/artifacts/:id", async (request, reply) => {
+    const params = request.params as { id: string };
+    const query = z.object({ token: z.string().min(32) }).parse(request.query);
+    const artifact = (await store.read()).artifacts.find((candidate) => candidate.id === params.id);
+    if (!artifact?.downloadTokenHash || !artifact.tokenExpiresAt || new Date(artifact.tokenExpiresAt).getTime() < Date.now() || !verifyToken(query.token, artifact.downloadTokenHash)) {
+      return reply.code(403).send({ error: "制品下载授权无效或已过期" });
+    }
+    const filePath = resolve(config.ARTIFACTS_DIR, artifact.storageName);
+    if (relative(resolve(config.ARTIFACTS_DIR), filePath).startsWith("..")) return reply.code(400).send({ error: "制品路径无效" });
+    try { await stat(filePath); } catch { return notFound(reply, "制品文件不存在"); }
+    reply.type(artifact.mimeType).header("Content-Disposition", `attachment; filename="${encodeURIComponent(artifact.fileName)}"`);
+    return reply.send(createReadStream(filePath));
+  });
+
   app.get("/api/auth/status", async (request) => {
     const state = await store.read();
     const user = await getCurrentUser(request);
@@ -468,6 +493,47 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
     return reply.code(201).send({ node: nodePublic(result.node), enrollmentToken: result.enrollmentToken });
   });
 
+  app.get("/api/artifacts", async (request, reply) => {
+    const user = await getCurrentUser(request);
+    if (!user) return unauthenticated(reply);
+    if (!isAdmin(user)) return forbidden(reply);
+    const state = await store.read();
+    return { artifacts: state.artifacts.map(({ downloadTokenHash: _token, ...artifact }) => artifact) };
+  });
+
+  app.post("/api/artifacts", async (request, reply) => {
+    const user = await getCurrentUser(request);
+    if (!user) return unauthenticated(reply);
+    if (!isAdmin(user)) return forbidden(reply);
+    const part = await request.file();
+    if (!part) return reply.code(422).send({ error: "请上传 JAR 或 ZIP 服务端包" });
+    const fileName = basename(part.filename || "");
+    const extension = extname(fileName).toLowerCase();
+    if (!fileName || ![".jar", ".zip"].includes(extension)) {
+      part.file.resume();
+      return reply.code(422).send({ error: "仅支持 .jar 和 .zip 服务端包" });
+    }
+    const artifactId = id();
+    const storageName = `${artifactId}${extension}`;
+    const destination = resolve(config.ARTIFACTS_DIR, storageName);
+    const digest = createHash("sha256");
+    const hashStream = new Transform({ transform(chunk, _encoding, callback) { digest.update(chunk); callback(null, chunk); } });
+    try {
+      await pipeline(part.file, hashStream, createWriteStream(destination, { flags: "wx" }));
+      if (part.file.truncated) throw new Error("上传文件超过大小限制");
+      const metadata = await stat(destination);
+      const artifact: ArtifactRecord = { id: artifactId, fileName, storageName, mimeType: part.mimetype || "application/octet-stream", sizeBytes: metadata.size, checksum: digest.digest("hex"), createdBy: user.id, createdAt: now() };
+      await store.transaction((state) => {
+        state.artifacts.unshift(artifact);
+        addAudit(state, user.id, "artifact.uploaded", artifact.id, artifact.fileName);
+      });
+      return reply.code(201).send({ artifact });
+    } catch (error) {
+      await rm(destination, { force: true });
+      throw error;
+    }
+  });
+
   app.get("/api/instances", async (request, reply) => {
     const user = await getCurrentUser(request);
     if (!user) return unauthenticated(reply);
@@ -482,8 +548,23 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
     const state = await store.read();
     if (!isAdmin(user) && !state.nodes.some((node) => node.id === input.nodeId)) return forbidden(reply);
     if (!isAdmin(user)) return forbidden(reply);
-    const instance = await createInstance(store, user.id, input);
-    const task = await enqueue(user.id, { type: "instance.create", nodeId: instance.nodeId, instanceId: instance.id, payload: { instance } });
+    const artifact = input.artifactId ? state.artifacts.find((candidate) => candidate.id === input.artifactId) : undefined;
+    if (input.kind === "custom" && !artifact) return reply.code(422).send({ error: "自定义服务端必须选择已上传的 JAR 或 ZIP 制品" });
+    if (artifact && input.kind !== "custom") return reply.code(422).send({ error: "仅自定义服务端可以使用上传制品" });
+    const customJar = artifact ? (input.customJar ?? (artifact.fileName.endsWith(".jar") ? artifact.fileName : "server.jar")) : undefined;
+    const instance = await createInstance(store, user.id, { ...input, environment: customJar ? { ...input.environment, CUSTOM_JAR: customJar } : input.environment });
+    let artifactTask: { id: string; fileName: string; token: string } | undefined;
+    if (artifact) {
+      const token = randomToken(32);
+      await store.transaction((draft) => {
+        const target = draft.artifacts.find((candidate) => candidate.id === artifact.id);
+        if (!target) return;
+        target.downloadTokenHash = hashToken(token);
+        target.tokenExpiresAt = new Date(Date.now() + config.ARTIFACT_TOKEN_TTL_MINUTES * 60_000).toISOString();
+      });
+      artifactTask = { id: artifact.id, fileName: artifact.fileName, token };
+    }
+    const task = await enqueue(user.id, { type: "instance.create", nodeId: instance.nodeId, instanceId: instance.id, payload: { instance, artifact: artifactTask } });
     return reply.code(202).send({ instance: instancePublic(instance), task: taskPublic(task) });
   });
 

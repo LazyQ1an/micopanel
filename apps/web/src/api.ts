@@ -5,9 +5,10 @@ export class ApiError extends Error {
 }
 
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
+  const formData = init?.body instanceof FormData;
   const response = await fetch(path, {
     credentials: "include",
-    headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
+    headers: { ...(formData ? {} : { "Content-Type": "application/json" }), ...(init?.headers ?? {}) },
     ...init
   });
   if (response.status === 204) return undefined as T;
@@ -24,4 +25,3 @@ export const formatBytes = (value?: number): string => {
 };
 
 export const formatTime = (value?: string): string => value ? new Intl.DateTimeFormat("zh-CN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(value)) : "--";
-

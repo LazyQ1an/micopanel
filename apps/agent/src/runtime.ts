@@ -2,10 +2,11 @@ import { createHash } from "node:crypto";
 import { createReadStream, createWriteStream, existsSync } from "node:fs";
 import { mkdir, readdir, readFile, rename, rm, stat, statfs, writeFile } from "node:fs/promises";
 import { cpus, freemem, loadavg, totalmem } from "node:os";
-import { basename, dirname, relative, resolve } from "node:path";
-import { PassThrough, type Readable } from "node:stream";
+import { basename, dirname, extname, relative, resolve } from "node:path";
+import { PassThrough, Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import AdmZip from "adm-zip";
 import Docker from "dockerode";
 import * as tar from "tar";
 import type { AgentTask, InstanceSpec, NodeUsage } from "@micopanel/protocol";
@@ -26,7 +27,8 @@ export class DockerRuntime {
     socketPath: string,
     private readonly dataRoot: string,
     private readonly publishConsole: (instanceId: string, line: string) => void,
-    s3Config?: S3Config
+    s3Config?: S3Config,
+    private readonly controllerUrl?: string
   ) {
     this.docker = new Docker({ socketPath });
     if (s3Config) {
@@ -224,12 +226,55 @@ export class DockerRuntime {
     return { message: "备份已恢复，旧数据已作为节点归档保留" };
   }
 
+  private async downloadArtifact(instance: InstanceSpec, artifact: { id: string; fileName: string; token: string }): Promise<void> {
+    if (!this.controllerUrl) throw new Error("Agent controller URL is not configured");
+    const safeName = basename(artifact.fileName);
+    const extension = extname(safeName).toLowerCase();
+    if (!safeName || ![".jar", ".zip"].includes(extension)) throw new Error("任务中的制品类型无效");
+    const root = this.instancePath(instance.id);
+    await mkdir(root, { recursive: true });
+    const url = new URL(this.controllerUrl);
+    url.pathname = `${url.pathname.replace(/\/$/, "")}/api/agent/artifacts/${artifact.id}`;
+    url.searchParams.set("token", artifact.token);
+    const response = await fetch(url);
+    if (!response.ok || !response.body) throw new Error(`制品下载失败：${response.status}`);
+    const temporary = resolve(root, `.micopanel-${artifact.id}${extension}`);
+    await pipeline(Readable.fromWeb(response.body as unknown as Parameters<typeof Readable.fromWeb>[0]), createWriteStream(temporary));
+    if (extension === ".jar") {
+      await rename(temporary, resolve(root, safeName));
+      return;
+    }
+    try {
+      const archive = new AdmZip(temporary);
+      let unpackedBytes = 0;
+      for (const entry of archive.getEntries()) {
+        const destination = resolve(root, entry.entryName);
+        const insideRoot = relative(root, destination);
+        if (insideRoot.startsWith("..") || insideRoot === "") throw new Error("ZIP 包含不安全路径");
+        if (entry.isDirectory) {
+          await mkdir(destination, { recursive: true });
+          continue;
+        }
+        unpackedBytes += entry.header.size;
+        if (unpackedBytes > 2 * 1024 * 1024 * 1024) throw new Error("ZIP 解包内容超过 2 GB 安全限制");
+        await mkdir(dirname(destination), { recursive: true });
+        await writeFile(destination, entry.getData());
+      }
+    } finally {
+      await rm(temporary, { force: true });
+    }
+  }
+
   async execute(task: AgentTask): Promise<TaskResult> {
     const rawInstance = task.payload.instance;
     const instance = rawInstance as InstanceSpec | undefined;
     switch (task.type) {
       case "instance.create":
         if (!instance) throw new Error("Create task did not include an instance spec");
+        {
+          const artifact = task.payload.artifact as { id?: string; fileName?: string; token?: string } | undefined;
+          if (artifact?.id && artifact.fileName && artifact.token) await this.downloadArtifact(instance, { id: artifact.id, fileName: artifact.fileName, token: artifact.token });
+        }
         await this.recreate(instance);
         return { message: "容器已创建并启动" };
       case "instance.start": {

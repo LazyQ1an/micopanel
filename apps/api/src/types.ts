@@ -101,6 +101,19 @@ export interface AuditRecord {
   createdAt: string;
 }
 
+export interface ArtifactRecord {
+  id: string;
+  fileName: string;
+  storageName: string;
+  mimeType: string;
+  sizeBytes: number;
+  checksum: string;
+  createdBy: string;
+  createdAt: string;
+  downloadTokenHash?: string;
+  tokenExpiresAt?: string;
+}
+
 export interface PanelState {
   users: User[];
   sessions: Session[];
@@ -111,6 +124,7 @@ export interface PanelState {
   backups: BackupRecord[];
   schedules: ScheduleRecord[];
   audits: AuditRecord[];
+  artifacts: ArtifactRecord[];
 }
 
 export const createEmptyState = (): PanelState => ({
@@ -122,5 +136,6 @@ export const createEmptyState = (): PanelState => ({
   tasks: [],
   backups: [],
   schedules: [],
-  audits: []
+  audits: [],
+  artifacts: []
 });

@@ -11,7 +11,10 @@ const testConfig = {
   APP_ENCRYPTION_KEY: "test-encryption-key-with-enough-length",
   BOOTSTRAP_USERNAME: "admin",
   BOOTSTRAP_PASSWORD: "unused-in-this-test",
-  CORS_ORIGIN: "http://localhost:5173"
+  CORS_ORIGIN: "http://localhost:5173",
+  ARTIFACTS_DIR: "./data/test-artifacts",
+  ARTIFACT_MAX_BYTES: 1024 * 1024,
+  ARTIFACT_TOKEN_TTL_MINUTES: 30
 };
 
 const json = (body: unknown) => ({ headers: { "content-type": "application/json" }, payload: JSON.stringify(body) });
@@ -62,6 +65,27 @@ test("control plane bootstraps, queues workloads, and archives safely", async ()
     const syncFiles = await app.inject({ method: "POST", url: `/api/instances/${instanceBody.instance.id}/files/sync`, headers: { cookie } });
     assert.equal(syncFiles.statusCode, 202);
     assert.equal(syncFiles.json().task.type, "file.list");
+
+    const missingArtifact = await app.inject({
+      method: "POST",
+      url: "/api/instances",
+      headers: { cookie, "content-type": "application/json" },
+      payload: JSON.stringify({ name: "custom-missing", nodeId: nodeBody.node.id, kind: "custom", version: "21", memoryMb: 1024, cpuCores: 1, diskMb: 2048, pids: 128, eulaAccepted: true })
+    });
+    assert.equal(missingArtifact.statusCode, 422);
+    const artifactId = "11111111-1111-4111-8111-111111111111";
+    await store.transaction((state) => {
+      state.artifacts.push({ id: artifactId, fileName: "server.jar", storageName: `${artifactId}.jar`, mimeType: "application/java-archive", sizeBytes: 12, checksum: "test", createdBy: "test", createdAt: new Date().toISOString() });
+    });
+    const custom = await app.inject({
+      method: "POST",
+      url: "/api/instances",
+      headers: { cookie, "content-type": "application/json" },
+      payload: JSON.stringify({ name: "custom-valid", nodeId: nodeBody.node.id, kind: "custom", version: "21", memoryMb: 1024, cpuCores: 1, diskMb: 2048, pids: 128, artifactId, eulaAccepted: true })
+    });
+    assert.equal(custom.statusCode, 202);
+    const artifactTask = (await store.read()).tasks.find((task) => task.instanceId === custom.json().instance.id)!;
+    assert.equal(typeof (artifactTask.payload.artifact as { token?: unknown }).token, "string");
 
     const backup = await app.inject({ method: "POST", url: `/api/instances/${instanceBody.instance.id}/backups`, headers: { cookie, "content-type": "application/json" }, payload: JSON.stringify({ destination: "local" }) });
     assert.equal(backup.statusCode, 202);

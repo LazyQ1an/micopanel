@@ -251,8 +251,34 @@ function NodeModal({ onClose, refresh, notify }: { onClose: () => void; refresh:
 
 function InstanceModal({ nodes, onClose, refresh, notify }: { nodes: Node[]; onClose: () => void; refresh: () => Promise<void>; notify: (message?: string) => void }) {
   const [busy, setBusy] = useState(false);
-  const submit = async (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const data = new FormData(event.currentTarget); setBusy(true); try { await api("/api/instances", { method: "POST", body: JSON.stringify({ name: data.get("name"), nodeId: data.get("nodeId"), kind: data.get("kind"), version: data.get("version"), memoryMb: Number(data.get("memory")), cpuCores: Number(data.get("cpu")), diskMb: Number(data.get("disk")), pids: 512, eulaAccepted: data.get("eula") === "on" }) }); await refresh(); onClose(); notify("实例创建任务已提交"); } catch (error) { notify(error instanceof Error ? error.message : "实例未创建"); } finally { setBusy(false); } };
-  return <Dialog title="创建 Minecraft 实例" onClose={onClose}>{nodes.length ? <form className="dialog-form" onSubmit={submit}><label>实例名称<input name="name" required placeholder="survival-01" /></label><div className="two-inputs"><label>节点<select name="nodeId" required>{nodes.map((node) => <option value={node.id} key={node.id}>{node.name}{node.online ? "" : "（离线，任务将排队）"}</option>)}</select></label><label>服务端<select name="kind" defaultValue="paper"><option value="paper">Paper</option><option value="vanilla">Vanilla Java</option><option value="fabric">Fabric</option><option value="forge">Forge</option><option value="bedrock">Bedrock</option><option value="custom">自定义包</option></select></label></div><div className="two-inputs"><label>版本<input name="version" defaultValue="1.21.4" required /></label><label>内存 MB<input name="memory" type="number" defaultValue="2048" min="512" /></label></div><div className="two-inputs"><label>vCPU<input name="cpu" type="number" step="0.25" defaultValue="1" min="0.25" /></label><label>磁盘 MB<input name="disk" type="number" defaultValue="10240" min="1024" /></label></div><label className="check-row"><input name="eula" type="checkbox" required />我已阅读并同意 Mojang EULA</label><button className="button primary" disabled={busy}>{busy && <LoaderCircle size={16} className="spin" />}创建实例</button></form> : <Empty icon={<Network size={24} />} title="请先添加节点" />}</Dialog>;
+  const [kind, setKind] = useState("paper");
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    setBusy(true);
+    try {
+      let artifactId: string | undefined;
+      if (kind === "custom") {
+        const file = data.get("artifact");
+        if (!(file instanceof File) || file.size === 0) throw new Error("请选择 JAR 或 ZIP 服务端包");
+        const upload = new FormData();
+        upload.append("file", file);
+        const result = await api<{ artifact: { id: string } }>("/api/artifacts", { method: "POST", body: upload });
+        artifactId = result.artifact.id;
+      }
+      await api("/api/instances", { method: "POST", body: JSON.stringify({ name: data.get("name"), nodeId: data.get("nodeId"), kind, version: data.get("version"), memoryMb: Number(data.get("memory")), cpuCores: Number(data.get("cpu")), diskMb: Number(data.get("disk")), pids: 512, artifactId, customJar: data.get("customJar") || undefined, eulaAccepted: data.get("eula") === "on" }) });
+      await refresh(); onClose(); notify("实例创建任务已提交");
+    } catch (error) { notify(error instanceof Error ? error.message : "实例未创建"); }
+    finally { setBusy(false); }
+  };
+  return <Dialog title="创建 Minecraft 实例" onClose={onClose}>{nodes.length ? <form className="dialog-form" onSubmit={submit}>
+    <label>实例名称<input name="name" required placeholder="survival-01" /></label>
+    <div className="two-inputs"><label>节点<select name="nodeId" required>{nodes.map((node) => <option value={node.id} key={node.id}>{node.name}{node.online ? "" : "（离线，任务将排队）"}</option>)}</select></label><label>服务端<select name="kind" value={kind} onChange={(event) => setKind(event.target.value)}><option value="paper">Paper</option><option value="vanilla">Vanilla Java</option><option value="fabric">Fabric</option><option value="forge">Forge</option><option value="bedrock">Bedrock</option><option value="custom">自定义包</option></select></label></div>
+    {kind === "custom" && <><label>服务端包<input name="artifact" type="file" accept=".jar,.zip,application/java-archive,application/zip" required /></label><label>入口 JAR<input name="customJar" placeholder="ZIP 包默认使用 server.jar" /></label></>}
+    <div className="two-inputs"><label>版本<input name="version" defaultValue="1.21.4" required /></label><label>内存 MB<input name="memory" type="number" defaultValue="2048" min="512" /></label></div>
+    <div className="two-inputs"><label>vCPU<input name="cpu" type="number" step="0.25" defaultValue="1" min="0.25" /></label><label>磁盘 MB<input name="disk" type="number" defaultValue="10240" min="1024" /></label></div>
+    <label className="check-row"><input name="eula" type="checkbox" required />我已阅读并同意 Mojang EULA</label><button className="button primary" disabled={busy}>{busy && <LoaderCircle size={16} className="spin" />}创建实例</button>
+  </form> : <Empty icon={<Network size={24} />} title="请先添加节点" />}</Dialog>;
 }
 
 function Dialog({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) { return <div className="modal-backdrop" role="presentation"><section className="dialog" role="dialog" aria-modal="true" aria-label={title}><div className="dialog-head"><h3>{title}</h3><button className="icon-button" title="关闭" onClick={onClose}><X size={18} /></button></div>{children}</section></div>; }

@@ -13,6 +13,7 @@
   "dependencies": {
     "@aws-sdk/client-s3": "^3.750.0",
     "@micopanel/protocol": "workspace:*",
+    "adm-zip": "^0.5.16",
     "dockerode": "^4.0.7",
     "tar": "^7.4.3",
     "ws": "^8.18.0",
@@ -20,6 +21,7 @@
   },
   "devDependencies": {
     "@types/dockerode": "^3.3.38",
+    "@types/adm-zip": "^0.5.7",
     "@types/node": "^22.13.14",
     "@types/ws": "^8.5.14",
     "tsx": "^4.19.3"

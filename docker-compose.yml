@@ -27,9 +27,12 @@ services:
       BOOTSTRAP_USERNAME: ${BOOTSTRAP_USERNAME:-admin}
       BOOTSTRAP_PASSWORD: ${BOOTSTRAP_PASSWORD:?Set BOOTSTRAP_PASSWORD in .env}
       CORS_ORIGIN: ${PUBLIC_URL:-http://localhost}
+      ARTIFACTS_DIR: /var/lib/micopanel/artifacts
     depends_on:
       postgres:
         condition: service_healthy
+    volumes:
+      - api-artifacts:/var/lib/micopanel/artifacts
 
   web:
     build:
@@ -43,4 +46,4 @@ services:
 
 volumes:
   postgres-data:
-
+  api-artifacts:
