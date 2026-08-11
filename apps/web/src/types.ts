@@ -44,6 +44,7 @@ export interface Task {
   attempt: number;
   message?: string;
   progress?: number;
+  retryAt?: string;
   createdAt: string;
   updatedAt: string;
 }

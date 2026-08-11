@@ -19,6 +19,25 @@ import type { StateStore } from "./store.js";
 
 const now = (): string => new Date().toISOString();
 
+export const MAX_TASK_ATTEMPTS = 3;
+export const TASK_RETRY_BASE_DELAY_MS = 15_000;
+export const TASK_STALE_AFTER_MS = 2 * 60_000;
+const AUTOMATIC_RETRY_TASK_TYPES = new Set<TaskType>([
+  "instance.create",
+  "instance.start",
+  "instance.stop",
+  "instance.restart",
+  "instance.kill",
+  "instance.backup",
+  "instance.archive",
+  "file.list",
+  "file.read",
+  "file.write"
+]);
+
+export const isAutomaticRetryableTask = (task: Pick<TaskRecord, "type">): boolean => AUTOMATIC_RETRY_TASK_TYPES.has(task.type);
+export const nextTaskRetryAt = (attempt: number): string => new Date(Date.now() + TASK_RETRY_BASE_DELAY_MS * 2 ** Math.max(0, attempt - 1)).toISOString();
+
 export const MANAGED_ENVIRONMENT_KEYS = new Set(["EULA", "TYPE", "VERSION", "MEMORY", "CUSTOM_JAR"]);
 
 export interface InstanceConfigurationInput {
@@ -216,6 +235,7 @@ export const taskPublic = (task: TaskRecord) => ({
   attempt: task.attempt,
   message: task.message,
   progress: task.progress,
+  retryAt: task.retryAt,
   createdAt: task.createdAt,
   updatedAt: task.updatedAt
 });

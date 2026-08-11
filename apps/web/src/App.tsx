@@ -113,6 +113,7 @@ const statusClass = (status: Instance["status"] | Task["status"]): string => {
       "queued",
       "delivered",
       "running",
+      "retrying",
     ].includes(status)
   )
     return "wait";
@@ -358,6 +359,15 @@ function ControlPanel({
       setMessage(error instanceof Error ? error.message : "操作未完成");
     }
   };
+  const retryTask = async (task: Task) => {
+    try {
+      await api(`/api/tasks/${task.id}/retry`, { method: "POST" });
+      setMessage(`${task.type}：重试任务已提交`);
+      void refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "任务未能重新提交");
+    }
+  };
   const signOut = async () => {
     await api("/api/auth/logout", { method: "POST" });
     await onSignOut();
@@ -490,7 +500,7 @@ function ControlPanel({
               <Nodes nodes={dashboard.nodes} onNew={() => setModal("node")} />
             )}
             {screen === "tasks" && (
-              <Tasks tasks={dashboard.tasks} instances={dashboard.instances} />
+              <Tasks tasks={dashboard.tasks} instances={dashboard.instances} onRetry={retryTask} />
             )}
             {screen === "backups" && (
               <Backups
@@ -941,10 +951,12 @@ function Tasks({
   tasks,
   instances,
   compact = false,
+  onRetry,
 }: {
   tasks: Task[];
   instances: Instance[];
   compact?: boolean;
+  onRetry?: (task: Task) => void;
 }) {
   return (
     <div className={`tasks-list ${compact ? "compact" : ""}`}>
@@ -960,19 +972,28 @@ function Tasks({
                 ?.name ?? "节点任务"}
             </small>
           </span>
-          <span className="task-message">{task.message ?? "等待节点接收"}</span>
-          <Status
-            value={
-              task.status === "succeeded"
-                ? "完成"
-                : task.status === "failed"
-                  ? "失败"
-                  : task.status === "running"
-                    ? "执行中"
-                    : "排队中"
-            }
-            status={task.status}
-          />
+          <span className="task-message">{task.status === "retrying" && task.retryAt ? `将在 ${formatTime(task.retryAt)} 自动重试（第 ${task.attempt + 1} 次）` : task.message ?? "等待节点接收"}</span>
+          <span className="task-controls">
+            <Status
+              value={
+                task.status === "succeeded"
+                  ? "完成"
+                  : task.status === "failed"
+                    ? "失败"
+                    : task.status === "retrying"
+                      ? "重试中"
+                      : task.status === "running"
+                        ? "执行中"
+                        : "排队中"
+              }
+              status={task.status}
+            />
+            {!compact && task.status === "failed" && onRetry && (
+              <button className="icon-button" title="重新提交失败任务" onClick={() => onRetry(task)}>
+                <RotateCcw size={15} />
+              </button>
+            )}
+          </span>
         </div>
       ))}
     </div>

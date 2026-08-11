@@ -64,6 +64,7 @@ export interface TaskRecord {
   attempt: number;
   message?: string;
   progress?: number;
+  retryAt?: string;
   createdBy: string;
   createdAt: string;
   updatedAt: string;

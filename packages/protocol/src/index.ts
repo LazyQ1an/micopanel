@@ -18,7 +18,7 @@ export const TASK_TYPES = [
   "file.download"
 ] as const;
 export type TaskType = (typeof TASK_TYPES)[number];
-export type TaskStatus = "queued" | "delivered" | "running" | "succeeded" | "failed" | "cancelled";
+export type TaskStatus = "queued" | "delivered" | "running" | "retrying" | "succeeded" | "failed" | "cancelled";
 
 export type Permission =
   | "instance.view"
@@ -105,4 +105,4 @@ export type UiEvent =
   | { type: "node.updated"; nodeId: string; usage?: NodeUsage; online?: boolean }
   | { type: "instance.updated"; instanceId: string; status: InstanceSpec["status"] }
   | { type: "console.output"; instanceId: string; line: string }
-  | { type: "task.updated"; taskId: string; status: TaskStatus; message?: string; progress?: number };
+  | { type: "task.updated"; taskId: string; status: TaskStatus; message?: string; progress?: number; retryAt?: string; attempt?: number };

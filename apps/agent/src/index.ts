@@ -4,6 +4,7 @@ import WebSocket from "ws";
 import type { AgentInboundMessage, AgentOutboundMessage, AgentTask, NodeUsage } from "@micopanel/protocol";
 import { loadConfig } from "./config.js";
 import { DockerRuntime } from "./runtime.js";
+import { TaskJournal } from "./task-journal.js";
 
 interface Credentials {
   nodeId: string;
@@ -36,9 +37,10 @@ class Agent {
   private taskChain = Promise.resolve();
   private heartbeat?: NodeJS.Timeout;
   private readonly runtime = new DockerRuntime(config.DOCKER_SOCKET, config.DATA_ROOT, (instanceId, line) => this.send({ type: "console.output", instanceId, line }), config.s3, config.CONTROLLER_URL);
+  private readonly taskJournal = new TaskJournal(resolve(config.DATA_ROOT, "task-journal.json"));
 
   async start(): Promise<void> {
-    await this.runtime.init();
+    await Promise.all([this.runtime.init(), this.taskJournal.init()]);
     this.credentials = await loadCredentials();
     this.connect();
   }
@@ -98,9 +100,19 @@ class Agent {
 
   private async runTask(task: AgentTask): Promise<void> {
     this.send({ type: "task.ack", taskId: task.id });
+    const previous = this.taskJournal.get(task.id);
+    if (previous) {
+      this.send({ type: "task.result", taskId: task.id, ok: true, message: previous.message, data: previous.data });
+      return;
+    }
     try {
       this.send({ type: "task.progress", taskId: task.id, message: "正在执行", progress: 10 });
       const result = await this.runtime.execute(task, (message, progress) => this.send({ type: "task.progress", taskId: task.id, message, progress }));
+      try {
+        await this.taskJournal.record(task.id, result);
+      } catch (error) {
+        console.error("[micopanel-agent] could not persist task result", error);
+      }
       this.send({ type: "task.result", taskId: task.id, ok: true, message: result.message, data: result.data });
     } catch (error) {
       this.send({ type: "task.result", taskId: task.id, ok: false, message: error instanceof Error ? error.message : "Unknown agent error" });

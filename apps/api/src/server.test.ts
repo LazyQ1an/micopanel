@@ -202,6 +202,29 @@ test("control plane bootstraps, queues workloads, and archives safely", async ()
     const collaboratorAfterRemove = await app.inject({ method: "GET", url: `/api/instances/${instanceBody.instance.id}`, headers: { cookie: collaboratorCookie } });
     assert.equal(collaboratorAfterRemove.statusCode, 403);
 
+    const failedCommandTaskId = "22222222-2222-4222-8222-222222222222";
+    await store.transaction((state) => {
+      state.tasks.unshift({
+        id: failedCommandTaskId,
+        type: "instance.command",
+        nodeId: nodeBody.node.id,
+        instanceId: instanceBody.instance.id,
+        payload: { command: "say manual retry" },
+        status: "failed",
+        attempt: 3,
+        message: "控制台不可用",
+        createdBy: "system",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      });
+    });
+    const removedCollaboratorRetry = await app.inject({ method: "POST", url: `/api/tasks/${failedCommandTaskId}/retry`, headers: { cookie: collaboratorCookie } });
+    assert.equal(removedCollaboratorRetry.statusCode, 403);
+    const manualRetry = await app.inject({ method: "POST", url: `/api/tasks/${failedCommandTaskId}/retry`, headers: { cookie } });
+    assert.equal(manualRetry.statusCode, 202);
+    assert.equal(manualRetry.json().task.type, "instance.command");
+    assert.notEqual(manualRetry.json().task.id, failedCommandTaskId);
+
     const createdSchedule = await app.inject({
       method: "POST",
       url: `/api/instances/${instanceBody.instance.id}/schedules`,

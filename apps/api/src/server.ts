@@ -36,10 +36,14 @@ import {
   instancePublic,
   isAdmin,
   managedEnvironment,
+  isAutomaticRetryableTask,
+  MAX_TASK_ATTEMPTS,
   MANAGED_ENVIRONMENT_KEYS,
   newBackup,
   newSchedule,
+  nextTaskRetryAt,
   nodePublic,
+  TASK_STALE_AFTER_MS,
   roleForNewUser,
   taskPublic,
   updateInstanceConfiguration
@@ -62,6 +66,16 @@ const sessionLifetimeMs = 1000 * 60 * 60 * 24 * 14;
 const archiveRetentionMs = 1000 * 60 * 60 * 24 * 7;
 const now = (): string => new Date().toISOString();
 const transferPublic = ({ tokenHash: _tokenHash, ...transfer }: FileTransferRecord) => transfer;
+
+const markTaskForRetry = (task: TaskRecord, reason: string): boolean => {
+  if (!isAutomaticRetryableTask(task) || task.attempt >= MAX_TASK_ATTEMPTS) return false;
+  task.status = "retrying";
+  task.retryAt = nextTaskRetryAt(task.attempt);
+  task.message = `${reason}；将在 ${task.retryAt} 自动重试`;
+  task.progress = 0;
+  task.updatedAt = now();
+  return true;
+};
 
 class RealtimeHub {
   readonly agents = new Map<string, SocketLike>();
@@ -232,16 +246,28 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
     const snapshot = await store.read();
     const task = snapshot.tasks.find((candidate) => candidate.id === taskId);
     if (!task || task.status !== "queued") return;
-    const agentTask: AgentTask = { id: task.id, type: task.type, instanceId: task.instanceId, payload: task.payload, attempt: task.attempt };
-    if (!hub.sendAgent(task.nodeId, { type: "task", task: agentTask })) return;
-    await store.transaction((state) => {
+    const reserved = await store.transaction((state) => {
       const target = state.tasks.find((candidate) => candidate.id === taskId);
-      if (!target || target.status !== "queued") return;
+      if (!target || target.status !== "queued") return undefined;
       target.status = "delivered";
       target.attempt += 1;
+      target.retryAt = undefined;
       target.updatedAt = now();
+      return { nodeId: target.nodeId, task: { id: target.id, type: target.type, instanceId: target.instanceId, payload: target.payload, attempt: target.attempt } satisfies AgentTask };
     });
-    hub.broadcast({ type: "task.updated", taskId, status: "delivered" });
+    if (!reserved) return;
+    if (!hub.sendAgent(reserved.nodeId, { type: "task", task: reserved.task })) {
+      await store.transaction((state) => {
+        const target = state.tasks.find((candidate) => candidate.id === taskId);
+        if (!target || target.status !== "delivered") return;
+        target.status = "queued";
+        target.attempt = Math.max(0, target.attempt - 1);
+        target.message = "节点尚未连接，等待重新投递";
+        target.updatedAt = now();
+      });
+      return;
+    }
+    hub.broadcast({ type: "task.updated", taskId, status: "delivered", attempt: reserved.task.attempt });
   };
 
   const enqueue = async (actorId: string, input: { type: TaskType; nodeId: string; instanceId?: string; payload?: Record<string, unknown> }): Promise<TaskRecord> => {
@@ -269,38 +295,50 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
     await sendPendingTasks(node.id);
   };
 
-  const agentTaskResult = async (message: Extract<AgentInboundMessage, { type: "task.result" }>): Promise<void> => {
-    let status: "succeeded" | "failed" = message.ok ? "succeeded" : "failed";
+  const agentTaskResult = async (nodeId: string, message: Extract<AgentInboundMessage, { type: "task.result" }>): Promise<void> => {
+    let status: "succeeded" | "failed" | "retrying" = message.ok ? "succeeded" : "failed";
     let instanceId: string | undefined;
     let transferStorageToRemove: string | undefined;
+    let retryAt: string | undefined;
+    let attempt = 0;
+    let retryScheduled = false;
+    let processed = false;
     await store.transaction((state) => {
-      const task = state.tasks.find((candidate) => candidate.id === message.taskId);
-      if (!task) return;
-      task.status = status;
-      task.message = message.message;
-      task.progress = 100;
+      const task = state.tasks.find((candidate) => candidate.id === message.taskId && candidate.nodeId === nodeId);
+      if (!task || task.status === "succeeded" || task.status === "failed" || task.status === "cancelled") return;
+      processed = true;
+      if (!message.ok && markTaskForRetry(task, message.message ?? "Agent task failed")) {
+        status = "retrying";
+        retryScheduled = true;
+      } else {
+        task.status = status;
+        task.retryAt = undefined;
+        task.message = message.message;
+        task.progress = 100;
+      }
+      retryAt = task.retryAt;
+      attempt = task.attempt;
       task.updatedAt = now();
       instanceId = task.instanceId;
       const instance = task.instanceId ? state.instances.find((candidate) => candidate.id === task.instanceId) : undefined;
       if (instance) {
         instance.updatedAt = now();
         if (!message.ok) {
-          instance.lastError = message.message ?? "Agent task failed";
-          if (task.type === "instance.create") instance.status = "error";
-        } else if (task.type === "instance.create" || task.type === "instance.stop" || task.type === "instance.kill") {
-          instance.status = "offline";
-        } else if (task.type === "instance.start" || task.type === "instance.restart") {
-          instance.status = "running";
-        } else if (task.type === "instance.restore") {
-          instance.status = task.payload.backup ? "running" : "offline";
-        } else if (task.type === "instance.archive") {
-          instance.status = "archived";
+          if (!retryScheduled) {
+            instance.lastError = message.message ?? "Agent task failed";
+            if (task.type === "instance.create") instance.status = "error";
+          }
+        } else {
+          if (task.type === "instance.create" || task.type === "instance.stop" || task.type === "instance.kill") instance.status = "offline";
+          else if (task.type === "instance.start" || task.type === "instance.restart") instance.status = "running";
+          else if (task.type === "instance.restore") instance.status = task.payload.backup ? "running" : "offline";
+          else if (task.type === "instance.archive") instance.status = "archived";
         }
       }
       if (task.type === "instance.backup") {
         const backup = state.backups.find((candidate) => candidate.id === String(task.payload.backupId));
         if (backup) {
-          backup.status = message.ok ? "available" : "failed";
+          backup.status = message.ok ? "available" : retryScheduled ? "creating" : "failed";
           backup.sizeBytes = Number(message.data?.sizeBytes) || undefined;
           backup.checksum = typeof message.data?.checksum === "string" ? message.data.checksum : undefined;
         }
@@ -330,10 +368,11 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
           }
         }
       }
-      addAudit(state, "agent", message.ok ? "task.succeeded" : "task.failed", task.id, message.message);
+      addAudit(state, "agent", message.ok ? "task.succeeded" : retryScheduled ? "task.retry.scheduled" : "task.failed", task.id, message.message);
     });
+    if (!processed) return;
     if (transferStorageToRemove) await rm(getTransferFilePath(transferStorageToRemove), { force: true });
-    hub.broadcast({ type: "task.updated", taskId: message.taskId, status, message: message.message, progress: 100 });
+    hub.broadcast({ type: "task.updated", taskId: message.taskId, status, message: message.message, progress: retryScheduled ? 0 : 100, retryAt, attempt });
     if (instanceId) {
       const state = await store.read();
       const instance = state.instances.find((candidate) => candidate.id === instanceId);
@@ -421,7 +460,7 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
       return connectedNodeId;
     }
     if (message.type === "task.result") {
-      await agentTaskResult(message);
+      await agentTaskResult(connectedNodeId, message);
       return connectedNodeId;
     }
     if (message.type === "console.output") {
@@ -1117,6 +1156,33 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
     return { tasks: state.tasks.filter((task) => !task.instanceId || visible.some((instance) => instance.id === task.instanceId)).slice(0, 100).map(taskPublic) };
   });
 
+  app.post("/api/tasks/:id/retry", async (request, reply) => {
+    const user = await getCurrentUser(request);
+    if (!user) return unauthenticated(reply);
+    const taskId = (request.params as { id: string }).id;
+    const state = await store.read();
+    const failedTask = state.tasks.find((candidate) => candidate.id === taskId);
+    if (!failedTask) return notFound(reply, "任务不存在");
+    if (failedTask.status !== "failed") return reply.code(409).send({ error: "只有失败任务可以重试" });
+    const instance = failedTask.instanceId ? state.instances.find((candidate) => candidate.id === failedTask.instanceId) : undefined;
+    if (!instance) return notFound(reply, "任务所属实例不存在");
+    const permission = failedTask.type === "instance.command"
+      ? "instance.console"
+      : failedTask.type === "instance.backup" || failedTask.type === "instance.restore"
+        ? "instance.backups"
+        : failedTask.type.startsWith("file.")
+          ? "instance.files"
+          : failedTask.type === "instance.create" || failedTask.type === "instance.archive"
+            ? undefined
+            : failedTask.type === "instance.restart" && failedTask.payload.applyConfig
+              ? "instance.config"
+              : "instance.power";
+    if (permission ? !canAccess(state, user, instance, permission) : !isAdmin(user) && instance.ownerId !== user.id) return forbidden(reply);
+    await store.transaction((draft) => addAudit(draft, user.id, "task.retry.requested", failedTask.id, failedTask.type));
+    const task = await enqueue(user.id, { type: failedTask.type, nodeId: failedTask.nodeId, instanceId: failedTask.instanceId, payload: structuredClone(failedTask.payload) });
+    return reply.code(202).send({ task: taskPublic(task) });
+  });
+
   app.get("/api/audit", async (request, reply) => {
     const user = await getCurrentUser(request);
     if (!user) return unauthenticated(reply);
@@ -1144,10 +1210,22 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
     socket.on("close", () => {
       if (!nodeId || hub.agents.get(nodeId) !== socket) return;
       hub.agents.delete(nodeId);
+      const requeuedTaskIds: string[] = [];
       void store.transaction((state) => {
         const node = state.nodes.find((candidate) => candidate.id === nodeId);
         if (node) node.online = false;
-      }).then(() => hub.broadcast({ type: "node.updated", nodeId: nodeId!, online: false }));
+        for (const task of state.tasks) {
+          if (task.nodeId !== nodeId || task.status !== "delivered") continue;
+          task.status = "queued";
+          task.retryAt = undefined;
+          task.message = "节点连接中断，等待重新投递";
+          task.updatedAt = now();
+          requeuedTaskIds.push(task.id);
+        }
+      }).then(() => {
+        hub.broadcast({ type: "node.updated", nodeId: nodeId!, online: false });
+        for (const taskId of requeuedTaskIds) hub.broadcast({ type: "task.updated", taskId, status: "queued", message: "节点连接中断，等待重新投递", progress: 0 });
+      });
     });
   });
 
@@ -1155,7 +1233,40 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
     void (async () => {
       const due = await store.transaction((state) => {
         const dueSchedules: Array<{ schedule: ScheduleRecord; instance: InstanceRecord }> = [];
+        const retryTaskIds: string[] = [];
         const currentTime = Date.now();
+        for (const task of state.tasks) {
+          if (task.status === "retrying" && task.retryAt && new Date(task.retryAt).getTime() <= currentTime) {
+            task.status = "queued";
+            task.retryAt = undefined;
+            task.message = `等待第 ${task.attempt + 1}/${MAX_TASK_ATTEMPTS} 次尝试`;
+            task.progress = 0;
+            task.updatedAt = now();
+            retryTaskIds.push(task.id);
+            continue;
+          }
+          if ((task.status !== "running" && task.status !== "delivered") || currentTime - new Date(task.updatedAt).getTime() < TASK_STALE_AFTER_MS) continue;
+          if (markTaskForRetry(task, "节点任务执行超时")) {
+            addAudit(state, "system", "task.retry.scheduled", task.id, task.message);
+            continue;
+          }
+          task.status = "failed";
+          task.retryAt = undefined;
+          task.progress = 100;
+          task.message = "节点任务执行超时，已停止自动重试";
+          task.updatedAt = now();
+          const instance = task.instanceId ? state.instances.find((candidate) => candidate.id === task.instanceId) : undefined;
+          if (instance) {
+            instance.updatedAt = now();
+            instance.lastError = task.message;
+            if (task.type === "instance.create") instance.status = "error";
+          }
+          if (task.type === "instance.backup") {
+            const backup = state.backups.find((candidate) => candidate.id === String(task.payload.backupId));
+            if (backup) backup.status = "failed";
+          }
+          addAudit(state, "system", "task.failed", task.id, task.message);
+        }
         for (const schedule of state.schedules) {
           if (!schedule.enabled || !schedule.nextRunAt || new Date(schedule.nextRunAt).getTime() > currentTime) continue;
           const instance = state.instances.find((candidate) => candidate.id === schedule.instanceId && candidate.status !== "archived");
@@ -1173,8 +1284,13 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
           expiredTransferStorage.push(transfer.storageName);
           addAudit(state, "system", "file.transfer.expired", `${transfer.instanceId}:${transfer.path}`);
         }
-        return { dueSchedules, expired, expiredTransferStorage };
+        return { dueSchedules, expired, expiredTransferStorage, retryTaskIds };
       });
+      for (const taskId of due.retryTaskIds) {
+        await deliverTask(taskId);
+        const task = (await store.read()).tasks.find((candidate) => candidate.id === taskId);
+        if (task) hub.broadcast({ type: "task.updated", taskId, status: task.status, message: task.message, progress: task.progress, retryAt: task.retryAt, attempt: task.attempt });
+      }
       for (const { schedule, instance } of due.dueSchedules) {
         const type: TaskType = schedule.action === "backup" ? "instance.backup" : schedule.action === "restart" ? "instance.restart" : "instance.command";
         const destination = schedule.action === "backup" && schedule.payload.destination === "s3" ? "s3" : "local";

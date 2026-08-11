@@ -94,6 +94,18 @@ destination. The control plane records the backup and submits the actual work to
 the schedule becomes due. Disabling a schedule clears its next run time; enabling it calculates a
 fresh run time from the stored cron expression.
 
+## Task reliability
+
+The control plane retains task state across restarts and requeues work that was delivered when an
+Agent disconnects before acknowledgement. Idempotent lifecycle, backup, and file-metadata tasks
+receive at most three automatic attempts with 15-second exponential backoff. Agents persist
+successful task results locally by task ID, so reconnect delivery returns the prior result instead
+of repeating completed work.
+
+Console commands, restores, and staged file transfers are intentionally not replayed
+automatically because their effects cannot be proven safe to duplicate. An operator with the
+original operation permission can explicitly resubmit a failed task from the task view.
+
 ## Security baseline
 
 - Browser sessions use signed, HttpOnly cookies.
