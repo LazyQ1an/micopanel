@@ -157,7 +157,7 @@ test("control plane bootstraps, queues workloads, and archives safely", async ()
       method: "PUT",
       url: `/api/instances/${instanceBody.instance.id}/members/${collaborator.id}`,
       headers: { cookie, "content-type": "application/json" },
-      payload: JSON.stringify({ permissions: ["instance.view", "instance.config"] })
+      payload: JSON.stringify({ permissions: ["instance.view", "instance.config", "instance.schedules"] })
     });
     assert.equal(memberWrite.statusCode, 200);
     const collaboratorLogin = await app.inject({ method: "POST", url: "/api/auth/login", ...json({ username: "builder", password: "correct-builder-123" }) });
@@ -174,6 +174,22 @@ test("control plane bootstraps, queues workloads, and archives safely", async ()
       payload: JSON.stringify({ version: "1.21.5", port: 25566, environment: { MOTD: "Builder managed" }, limits: { memoryMb: 3072, cpuCores: 1.5, diskMb: 8192, pids: 320 }, confirmRecreate: true })
     });
     assert.equal(collaboratorConfigUpdate.statusCode, 202);
+    const collaboratorSchedules = await app.inject({ method: "GET", url: `/api/instances/${instanceBody.instance.id}/schedules`, headers: { cookie: collaboratorCookie } });
+    assert.equal(collaboratorSchedules.statusCode, 200);
+    const collaboratorCommandSchedule = await app.inject({
+      method: "POST",
+      url: `/api/instances/${instanceBody.instance.id}/schedules`,
+      headers: { cookie: collaboratorCookie, "content-type": "application/json" },
+      payload: JSON.stringify({ name: "越权命令", cron: "0 4 * * *", action: "command", payload: { command: "say should-not-run" } })
+    });
+    assert.equal(collaboratorCommandSchedule.statusCode, 403);
+    const collaboratorBackupSchedule = await app.inject({
+      method: "POST",
+      url: `/api/instances/${instanceBody.instance.id}/schedules`,
+      headers: { cookie: collaboratorCookie, "content-type": "application/json" },
+      payload: JSON.stringify({ name: "越权备份", cron: "0 4 * * *", action: "backup", payload: { destination: "s3" } })
+    });
+    assert.equal(collaboratorBackupSchedule.statusCode, 403);
     const collaboratorMemberWrite = await app.inject({
       method: "PUT",
       url: `/api/instances/${instanceBody.instance.id}/members/${collaborator.id}`,
@@ -185,6 +201,34 @@ test("control plane bootstraps, queues workloads, and archives safely", async ()
     assert.equal(memberRemove.statusCode, 204);
     const collaboratorAfterRemove = await app.inject({ method: "GET", url: `/api/instances/${instanceBody.instance.id}`, headers: { cookie: collaboratorCookie } });
     assert.equal(collaboratorAfterRemove.statusCode, 403);
+
+    const createdSchedule = await app.inject({
+      method: "POST",
+      url: `/api/instances/${instanceBody.instance.id}/schedules`,
+      headers: { cookie, "content-type": "application/json" },
+      payload: JSON.stringify({ name: "每日公告", cron: "0 4 * * *", action: "command", payload: { command: "say scheduled" } })
+    });
+    assert.equal(createdSchedule.statusCode, 201);
+    const scheduleId = createdSchedule.json().schedule.id as string;
+    const invalidSchedule = await app.inject({
+      method: "POST",
+      url: `/api/instances/${instanceBody.instance.id}/schedules`,
+      headers: { cookie, "content-type": "application/json" },
+      payload: JSON.stringify({ name: "空命令", cron: "0 4 * * *", action: "command", payload: { command: "" } })
+    });
+    assert.equal(invalidSchedule.statusCode, 422);
+    const updatedSchedule = await app.inject({
+      method: "PUT",
+      url: `/api/instances/${instanceBody.instance.id}/schedules/${scheduleId}`,
+      headers: { cookie, "content-type": "application/json" },
+      payload: JSON.stringify({ name: "每日 S3 备份", cron: "0 5 * * *", action: "backup", payload: { destination: "s3" }, enabled: false })
+    });
+    assert.equal(updatedSchedule.statusCode, 200);
+    assert.equal(updatedSchedule.json().schedule.enabled, false);
+    assert.equal(updatedSchedule.json().schedule.payload.destination, "s3");
+    assert.equal(updatedSchedule.json().schedule.nextRunAt, undefined);
+    const deletedSchedule = await app.inject({ method: "DELETE", url: `/api/instances/${instanceBody.instance.id}/schedules/${scheduleId}`, headers: { cookie } });
+    assert.equal(deletedSchedule.statusCode, 204);
 
     const missingArtifact = await app.inject({
       method: "POST",

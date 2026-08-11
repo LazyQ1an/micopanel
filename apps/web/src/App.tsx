@@ -24,6 +24,7 @@ import {
   Menu,
   Network,
   Pause,
+  Pencil,
   Play,
   Plus,
   Power,
@@ -36,6 +37,8 @@ import {
   SquareTerminal,
   Terminal,
   Trash2,
+  ToggleLeft,
+  ToggleRight,
   Users,
   X,
 } from "lucide-react";
@@ -1116,8 +1119,6 @@ function InstanceWorkspace({
   const [editor, setEditor] = useState<{ path: string; content: string }>();
   const [fileBusy, setFileBusy] = useState(false);
   const [transfer, setTransfer] = useState<FileTransfer>();
-  const [scheduleName, setScheduleName] = useState("");
-  const [cron, setCron] = useState("0 4 * * *");
   useEffect(() => {
     setTab("console");
     setDirectory("/");
@@ -1287,25 +1288,6 @@ function InstanceWorkspace({
       reload();
     } catch (error) {
       notify(error instanceof Error ? error.message : "备份任务未完成");
-    }
-  };
-  const addSchedule = async (event: FormEvent) => {
-    event.preventDefault();
-    try {
-      await api(`/api/instances/${instance.id}/schedules`, {
-        method: "POST",
-        body: JSON.stringify({
-          name: scheduleName,
-          cron,
-          action: "backup",
-          payload: {},
-        }),
-      });
-      setScheduleName("");
-      notify("计划任务已创建");
-      reload();
-    } catch (error) {
-      notify(error instanceof Error ? error.message : "计划任务未创建");
     }
   };
   return (
@@ -1594,6 +1576,7 @@ function InstanceWorkspace({
           )}
         </div>
       )}
+      {tab === "schedules" && <ScheduleTool detail={detail} instance={instance} notify={notify} reload={reload} />}
       {tab === "members" && <MembersTool instance={instance} notify={notify} />}
       {tab === "backups" && (
         <div className="backup-tool">
@@ -1608,53 +1591,183 @@ function InstanceWorkspace({
           )}
         </div>
       )}
-      {tab === "schedules" && (
-        <div className="schedule-tool">
-          <form onSubmit={addSchedule}>
-            <label>
-              任务名称
-              <input
-                value={scheduleName}
-                required
-                onChange={(event) => setScheduleName(event.target.value)}
-                placeholder="每日备份"
-              />
-            </label>
-            <label>
-              Cron
-              <input
-                value={cron}
-                required
-                onChange={(event) => setCron(event.target.value)}
-              />
-            </label>
-            <button className="button primary">
-              <Plus size={16} />
-              添加备份计划
-            </button>
-          </form>
-          {detail?.schedules.length ? (
-            detail.schedules.map((schedule: Schedule) => (
-              <div className="schedule-row" key={schedule.id}>
-                <Clock3 size={17} />
-                <span>
-                  <strong>{schedule.name}</strong>
-                  <small>
-                    {schedule.cron} · 下次 {formatTime(schedule.nextRunAt)}
-                  </small>
-                </span>
-                <Status
-                  value={schedule.enabled ? "已启用" : "暂停"}
-                  status={schedule.enabled ? "running" : "offline"}
-                />
-              </div>
-            ))
-          ) : (
-            <p className="quiet">还没有计划任务。</p>
-          )}
-        </div>
-      )}
     </section>
+  );
+}
+
+function ScheduleTool({
+  detail,
+  instance,
+  notify,
+  reload,
+}: {
+  detail?: InstanceDetail;
+  instance: Instance;
+  notify: (message?: string) => void;
+  reload: () => void;
+}) {
+  const [name, setName] = useState("");
+  const [cron, setCron] = useState("0 4 * * *");
+  const [action, setAction] = useState<Schedule["action"]>("backup");
+  const [command, setCommand] = useState("");
+  const [destination, setDestination] = useState<"local" | "s3">("local");
+  const [editing, setEditing] = useState<Schedule>();
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    setName("");
+    setCron("0 4 * * *");
+    setAction("backup");
+    setCommand("");
+    setDestination("local");
+    setEditing(undefined);
+  }, [instance.id]);
+
+  const reset = () => {
+    setName("");
+    setCron("0 4 * * *");
+    setAction("backup");
+    setCommand("");
+    setDestination("local");
+    setEditing(undefined);
+  };
+  const payloadForAction = (): Record<string, unknown> => {
+    if (action === "command") {
+      if (!command.trim()) throw new Error("请输入计划任务命令");
+      return { command: command.trim() };
+    }
+    if (action === "backup") return { destination };
+    return {};
+  };
+  const save = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setBusy(true);
+    try {
+      const payload = { name, cron, action, payload: payloadForAction() };
+      await api(
+        editing
+          ? `/api/instances/${instance.id}/schedules/${editing.id}`
+          : `/api/instances/${instance.id}/schedules`,
+        {
+          method: editing ? "PUT" : "POST",
+          body: JSON.stringify(editing ? { ...payload, enabled: editing.enabled } : payload),
+        },
+      );
+      notify(editing ? "计划任务已更新" : "计划任务已创建");
+      reset();
+      reload();
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "计划任务未保存");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const beginEdit = (schedule: Schedule) => {
+    setEditing(schedule);
+    setName(schedule.name);
+    setCron(schedule.cron);
+    setAction(schedule.action);
+    setCommand(typeof schedule.payload.command === "string" ? schedule.payload.command : "");
+    setDestination(schedule.payload.destination === "s3" ? "s3" : "local");
+  };
+  const writeEnabled = async (schedule: Schedule, enabled: boolean) => {
+    setBusy(true);
+    try {
+      await api(`/api/instances/${instance.id}/schedules/${schedule.id}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          name: schedule.name,
+          cron: schedule.cron,
+          action: schedule.action,
+          payload: schedule.payload,
+          enabled,
+        }),
+      });
+      notify(enabled ? "计划任务已启用" : "计划任务已暂停");
+      reload();
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "计划任务状态未更新");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const remove = async (schedule: Schedule) => {
+    if (!window.confirm(`删除计划任务“${schedule.name}”？`)) return;
+    setBusy(true);
+    try {
+      await api(`/api/instances/${instance.id}/schedules/${schedule.id}`, { method: "DELETE" });
+      if (editing?.id === schedule.id) reset();
+      notify("计划任务已删除");
+      reload();
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "计划任务未删除");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const schedules = detail?.schedules ?? [];
+  return (
+    <div className="schedule-tool schedule-manager">
+      <div className="tool-title">
+        <span><Clock3 size={18} /> {editing ? "编辑计划任务" : "计划任务"}</span>
+        <span>{schedules.length} 条</span>
+      </div>
+      <form className="schedule-form" onSubmit={save}>
+        <label>
+          任务名称
+          <input value={name} maxLength={64} required placeholder="每日备份" onChange={(event) => setName(event.target.value)} />
+        </label>
+        <label>
+          Cron
+          <input value={cron} required placeholder="0 4 * * *" onChange={(event) => setCron(event.target.value)} />
+        </label>
+        <label>
+          动作
+          <select value={action} onChange={(event) => setAction(event.target.value as Schedule["action"])}>
+            <option value="backup">备份</option>
+            <option value="restart">重启实例</option>
+            <option value="command">执行命令</option>
+          </select>
+        </label>
+        {action === "backup" && (
+          <label>
+            备份目标
+            <select value={destination} onChange={(event) => setDestination(event.target.value as "local" | "s3")}>
+              <option value="local">节点本地</option>
+              <option value="s3">S3 / MinIO</option>
+            </select>
+          </label>
+        )}
+        {action === "command" && (
+          <label className="schedule-command">
+            控制台命令
+            <input value={command} required placeholder="say 服务器即将重启" onChange={(event) => setCommand(event.target.value)} />
+          </label>
+        )}
+        <div className="schedule-form-actions">
+          <button className="button primary" disabled={busy}>
+            {busy ? <LoaderCircle size={16} className="spin" /> : editing ? <Save size={16} /> : <Plus size={16} />}
+            {editing ? "保存计划任务" : "添加计划任务"}
+          </button>
+          {editing && <button className="icon-button" type="button" title="取消编辑" onClick={reset}><X size={16} /></button>}
+        </div>
+      </form>
+      {schedules.length ? schedules.map((schedule) => (
+        <div className="schedule-row schedule-manager-row" key={schedule.id}>
+          <Clock3 size={17} />
+          <span>
+            <strong>{schedule.name}</strong>
+            <small>{schedule.cron} · {schedule.action === "backup" ? `备份至 ${schedule.payload.destination === "s3" ? "S3 / MinIO" : "节点本地"}` : schedule.action === "restart" ? "重启实例" : `命令：${String(schedule.payload.command ?? "")}`} · 下次 {formatTime(schedule.nextRunAt)}</small>
+          </span>
+          <Status value={schedule.enabled ? "已启用" : "已暂停"} status={schedule.enabled ? "running" : "offline"} />
+          <div className="schedule-row-actions">
+            <button className="icon-button" title="编辑计划任务" disabled={busy} onClick={() => beginEdit(schedule)}><Pencil size={14} /></button>
+            <button className="icon-button" title={schedule.enabled ? "暂停计划任务" : "启用计划任务"} disabled={busy} onClick={() => void writeEnabled(schedule, !schedule.enabled)}>{schedule.enabled ? <ToggleRight size={16} /> : <ToggleLeft size={16} />}</button>
+            <button className="icon-button action-bad" title="删除计划任务" disabled={busy} onClick={() => void remove(schedule)}><Trash2 size={14} /></button>
+          </div>
+        </div>
+      )) : <p className="quiet">还没有计划任务。</p>}
+    </div>
   );
 }
 

@@ -241,7 +241,7 @@ export const newBackup = (instanceId: string, actorId: string, destination: "loc
   createdAt: now()
 });
 
-export const newSchedule = (instanceId: string, input: { name: string; cron: string; action: ScheduleRecord["action"]; payload: Record<string, unknown> }): ScheduleRecord => {
+export const newSchedule = (instanceId: string, input: { name: string; cron: string; action: ScheduleRecord["action"]; payload: Record<string, unknown>; enabled?: boolean }): ScheduleRecord => {
   const nextRun = new Cron(input.cron.trim()).nextRun();
   return {
     id: id(),
@@ -250,8 +250,8 @@ export const newSchedule = (instanceId: string, input: { name: string; cron: str
     cron: input.cron.trim(),
     action: input.action,
     payload: input.payload,
-    enabled: true,
-    nextRunAt: nextRun?.toISOString(),
+    enabled: input.enabled ?? true,
+    nextRunAt: input.enabled === false ? undefined : nextRun?.toISOString(),
     createdAt: now()
   };
 };

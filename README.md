@@ -81,6 +81,19 @@ Only additional environment variables are editable. Template-defined server type
 runtime version and memory values, and a trusted custom JAR entry are panel-managed and cannot be
 overridden through the browser or API configuration request.
 
+## Scheduled tasks
+
+The instance workspace can create, edit, pause, resume, and delete cron schedules for backups,
+restarts, and console commands. Managing a schedule requires `instance.schedules`; its action
+also requires the corresponding operation permission: `instance.backups` for backups,
+`instance.power` for restarts, and `instance.console` for commands. This prevents a collaborator
+from using a schedule to gain an ability that was not granted directly.
+
+Scheduled backups can target the node's local backup store or the Agent's configured S3/MinIO
+destination. The control plane records the backup and submits the actual work to the Agent when
+the schedule becomes due. Disabling a schedule clears its next run time; enabling it calculates a
+fresh run time from the stored cron expression.
+
 ## Security baseline
 
 - Browser sessions use signed, HttpOnly cookies.

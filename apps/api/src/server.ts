@@ -114,12 +114,13 @@ const instanceSchema = z.object({
 });
 const actionSchema = z.object({ action: z.enum(["start", "stop", "restart", "kill", "command"]), command: z.string().min(1).max(2000).optional() });
 const backupSchema = z.object({ destination: z.enum(["local", "s3"]).default("local") });
-const scheduleSchema = z.object({
-  name: z.string().min(2).max(64),
-  cron: z.string().min(9).max(128),
-  action: z.enum(["command", "backup", "restart"]),
-  payload: z.record(z.unknown()).default({})
-});
+const scheduleActionSchema = z.discriminatedUnion("action", [
+  z.object({ action: z.literal("command"), payload: z.object({ command: z.string().min(1).max(2000) }) }),
+  z.object({ action: z.literal("backup"), payload: z.object({ destination: z.enum(["local", "s3"]).default("local") }).default({}) }),
+  z.object({ action: z.literal("restart"), payload: z.object({}).default({}) })
+]);
+const scheduleSchema = z.object({ name: z.string().min(2).max(64), cron: z.string().min(9).max(128) }).and(scheduleActionSchema);
+const scheduleUpdateSchema = z.object({ name: z.string().min(2).max(64), cron: z.string().min(9).max(128), enabled: z.boolean() }).and(scheduleActionSchema);
 const memberSchema = z.object({ permissions: z.array(z.enum(ALL_INSTANCE_PERMISSIONS)).min(1) });
 const userSchema = z.object({ username: z.string().min(3).max(32), password: z.string().min(10).max(128), role: z.enum(["admin", "user"]).default("user") });
 const environmentSchema = z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).max(128), z.string().max(4096))
@@ -216,6 +217,15 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
     if (!instance) return { user: undefined, instance: undefined, response: notFound(reply, "实例不存在") };
     if (!isAdmin(user) && instance.ownerId !== user.id) return { user: undefined, instance: undefined, response: forbidden(reply) };
     return { user, instance };
+  };
+
+  const canScheduleAction = async (user: User, instance: InstanceRecord, action: ScheduleRecord["action"]): Promise<boolean> => {
+    const permission: Record<ScheduleRecord["action"], Permission> = {
+      command: "instance.console",
+      restart: "instance.power",
+      backup: "instance.backups"
+    };
+    return canAccess(await store.read(), user, instance, permission[action]);
   };
 
   const deliverTask = async (taskId: string): Promise<void> => {
@@ -973,6 +983,7 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
     const access = await getInstanceAccess(request, reply, "instance.schedules");
     if (!access.user || !access.instance) return access.response;
     const input = scheduleSchema.parse(request.body);
+    if (!(await canScheduleAction(access.user, access.instance, input.action))) return forbidden(reply);
     let schedule: ScheduleRecord;
     try {
       schedule = newSchedule(access.instance.id, input);
@@ -984,6 +995,48 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
       addAudit(state, access.user!.id, "schedule.created", schedule.id, schedule.name);
     });
     return reply.code(201).send({ schedule });
+  });
+
+  app.put("/api/instances/:id/schedules/:scheduleId", async (request, reply) => {
+    const access = await getInstanceAccess(request, reply, "instance.schedules");
+    if (!access.user || !access.instance) return access.response;
+    const scheduleId = (request.params as { scheduleId: string }).scheduleId;
+    const input = scheduleUpdateSchema.parse(request.body);
+    if (!(await store.read()).schedules.some((schedule) => schedule.id === scheduleId && schedule.instanceId === access.instance!.id)) return notFound(reply, "计划任务不存在");
+    if (!(await canScheduleAction(access.user, access.instance, input.action))) return forbidden(reply);
+    let replacement: ScheduleRecord;
+    try {
+      replacement = newSchedule(access.instance.id, input);
+    } catch {
+      return reply.code(422).send({ error: "Cron 表达式无效" });
+    }
+    const schedule = await store.transaction((state) => {
+      const target = state.schedules.find((candidate) => candidate.id === scheduleId && candidate.instanceId === access.instance!.id)!;
+      target.name = replacement.name;
+      target.cron = replacement.cron;
+      target.action = replacement.action;
+      target.payload = replacement.payload;
+      target.enabled = replacement.enabled;
+      target.nextRunAt = replacement.nextRunAt;
+      addAudit(state, access.user!.id, "schedule.updated", target.id, `${target.action}; ${target.enabled ? "enabled" : "disabled"}`);
+      return target;
+    });
+    return { schedule };
+  });
+
+  app.delete("/api/instances/:id/schedules/:scheduleId", async (request, reply) => {
+    const access = await getInstanceAccess(request, reply, "instance.schedules");
+    if (!access.user || !access.instance) return access.response;
+    const scheduleId = (request.params as { scheduleId: string }).scheduleId;
+    const removed = await store.transaction((state) => {
+      const index = state.schedules.findIndex((schedule) => schedule.id === scheduleId && schedule.instanceId === access.instance!.id);
+      if (index < 0) return false;
+      state.schedules.splice(index, 1);
+      addAudit(state, access.user!.id, "schedule.deleted", scheduleId, access.instance!.id);
+      return true;
+    });
+    if (!removed) return notFound(reply, "计划任务不存在");
+    return reply.code(204).send();
   });
 
   app.put("/api/instances/:id/members/:userId", async (request, reply) => {
@@ -1124,8 +1177,9 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
       });
       for (const { schedule, instance } of due.dueSchedules) {
         const type: TaskType = schedule.action === "backup" ? "instance.backup" : schedule.action === "restart" ? "instance.restart" : "instance.command";
-        const backup = schedule.action === "backup" ? await store.transaction((state) => { const created = newBackup(instance.id, "system", "local"); state.backups.unshift(created); return created; }) : undefined;
-        await enqueue("system", { type, nodeId: instance.nodeId, instanceId: instance.id, payload: schedule.action === "backup" ? { backupId: backup!.id, destination: "local", instance } : schedule.action === "restart" ? { instance } : schedule.payload });
+        const destination = schedule.action === "backup" && schedule.payload.destination === "s3" ? "s3" : "local";
+        const backup = schedule.action === "backup" ? await store.transaction((state) => { const created = newBackup(instance.id, "system", destination); state.backups.unshift(created); return created; }) : undefined;
+        await enqueue("system", { type, nodeId: instance.nodeId, instanceId: instance.id, payload: schedule.action === "backup" ? { backupId: backup!.id, destination: backup!.destination, instance } : schedule.action === "restart" ? { instance } : schedule.payload });
       }
       for (const instance of due.expired) await enqueue("system", { type: "instance.archive", nodeId: instance.nodeId, instanceId: instance.id, payload: { instance, purge: true } });
       await Promise.all(due.expiredTransferStorage.map((storageName) => rm(getTransferFilePath(storageName), { force: true })));
