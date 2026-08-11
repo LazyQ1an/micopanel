@@ -10,6 +10,7 @@ test("node resource snapshots report usable host metrics", async () => {
   const runtime = new DockerRuntime("/var/run/docker.sock", root, () => undefined);
   try {
     const usage = await runtime.usage();
+    assert.equal(usage.cpuCores > 0, true);
     assert.equal(Number.isFinite(usage.cpuPercent), true);
     assert.equal(usage.cpuPercent >= 0 && usage.cpuPercent <= 100, true);
     assert.equal(usage.memoryLimitBytes > 0, true);

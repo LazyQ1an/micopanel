@@ -31,14 +31,18 @@ import {
   createInstance,
   createNode,
   createTask,
+  configurableEnvironment,
   findUser,
   instancePublic,
   isAdmin,
+  managedEnvironment,
+  MANAGED_ENVIRONMENT_KEYS,
   newBackup,
   newSchedule,
   nodePublic,
   roleForNewUser,
-  taskPublic
+  taskPublic,
+  updateInstanceConfiguration
 } from "./service.js";
 import { createStore, type StateStore } from "./store.js";
 import { SERVER_TEMPLATES } from "./templates.js";
@@ -103,7 +107,9 @@ const instanceSchema = z.object({
   port: z.number().int().min(1024).max(65535).optional(),
   artifactId: z.string().uuid().optional(),
   customJar: z.string().min(1).max(128).refine((value) => !value.includes("/") && !value.includes("\\") && value.endsWith(".jar"), "自定义入口 JAR 无效").optional(),
-  environment: z.record(z.string().max(128)).default({}),
+  environment: z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).max(128), z.string().max(4096))
+    .refine((environment) => Object.keys(environment).every((key) => !MANAGED_ENVIRONMENT_KEYS.has(key)), "不能修改受管环境变量")
+    .default({}),
   eulaAccepted: z.literal(true)
 });
 const actionSchema = z.object({ action: z.enum(["start", "stop", "restart", "kill", "command"]), command: z.string().min(1).max(2000).optional() });
@@ -116,6 +122,22 @@ const scheduleSchema = z.object({
 });
 const memberSchema = z.object({ permissions: z.array(z.enum(ALL_INSTANCE_PERMISSIONS)).min(1) });
 const userSchema = z.object({ username: z.string().min(3).max(32), password: z.string().min(10).max(128), role: z.enum(["admin", "user"]).default("user") });
+const environmentSchema = z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).max(128), z.string().max(4096))
+  .refine((environment) => Object.keys(environment).length <= 64, "环境变量数量不能超过 64 个")
+  .refine((environment) => Object.keys(environment).every((key) => !MANAGED_ENVIRONMENT_KEYS.has(key)), "不能修改受管环境变量");
+const limitsSchema = z.object({
+  memoryMb: z.number().int().min(512).max(262144),
+  cpuCores: z.number().min(0.25).max(128),
+  diskMb: z.number().int().min(1024).max(10485760),
+  pids: z.number().int().min(64).max(32768)
+});
+const instanceConfigurationSchema = z.object({
+  version: z.string().min(1).max(64),
+  port: z.number().int().min(1024).max(65535),
+  environment: environmentSchema,
+  limits: limitsSchema,
+  confirmRecreate: z.literal(true)
+});
 const safeFilePath = (path: string): boolean => {
   if (!path.startsWith("/") || path === "/" || path.includes("\\") || path.includes("\0")) return false;
   return path.split("/").every((segment, index) => index === 0 || (segment.length > 0 && segment !== "." && segment !== ".."));
@@ -663,7 +685,7 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
     if (input.kind === "custom" && !artifact) return reply.code(422).send({ error: "自定义服务端必须选择已上传的 JAR 或 ZIP 制品" });
     if (artifact && input.kind !== "custom") return reply.code(422).send({ error: "仅自定义服务端可以使用上传制品" });
     const customJar = artifact ? (input.customJar ?? (artifact.fileName.endsWith(".jar") ? artifact.fileName : "server.jar")) : undefined;
-    const instance = await createInstance(store, user.id, { ...input, environment: customJar ? { ...input.environment, CUSTOM_JAR: customJar } : input.environment });
+    const instance = await createInstance(store, user.id, { ...input, customJar });
     let artifactTask: { id: string; fileName: string; token: string } | undefined;
     if (artifact) {
       const token = randomToken(32);
@@ -685,6 +707,10 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
     const state = await store.read();
     return {
       instance: instancePublic(access.instance),
+      configuration: {
+        environment: configurableEnvironment(access.instance),
+        managedEnvironment: managedEnvironment(access.instance)
+      },
       members: state.members.filter((member) => member.instanceId === access.instance!.id),
       console: access.instance.console,
       files: access.instance.fileIndex,
@@ -731,17 +757,15 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
   app.put("/api/instances/:id/config", async (request, reply) => {
     const access = await getInstanceAccess(request, reply, "instance.config");
     if (!access.user || !access.instance) return access.response;
-    const input = z.object({ environment: z.record(z.string().max(128)), limits: z.object({ memoryMb: z.number().int().min(512), cpuCores: z.number().min(0.25), diskMb: z.number().int().min(1024), pids: z.number().int().min(64) }) }).parse(request.body);
-    const instance = await store.transaction((state) => {
-      const target = state.instances.find((candidate) => candidate.id === access.instance!.id)!;
-      target.environment = input.environment;
-      target.limits = input.limits;
-      target.updatedAt = now();
-      addAudit(state, access.user!.id, "instance.config.updated", target.id);
-      return target;
-    });
+    if (access.instance.status === "archived") return reply.code(409).send({ error: "归档实例必须恢复后才能修改配置" });
+    const input = instanceConfigurationSchema.parse(request.body);
+    const instance = await updateInstanceConfiguration(store, access.user.id, access.instance.id, input);
     const task = await enqueue(access.user.id, { type: "instance.restart", nodeId: instance.nodeId, instanceId: instance.id, payload: { instance, applyConfig: true } });
-    return reply.code(202).send({ instance: instancePublic(instance), task: taskPublic(task) });
+    return reply.code(202).send({
+      instance: instancePublic(instance),
+      configuration: { environment: configurableEnvironment(instance), managedEnvironment: managedEnvironment(instance) },
+      task: taskPublic(task)
+    });
   });
 
   app.get("/api/instances/:id/files", async (request, reply) => {

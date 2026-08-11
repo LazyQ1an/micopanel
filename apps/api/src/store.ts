@@ -31,14 +31,14 @@ export class MemoryStore implements StateStore {
     return clone(this.state);
   }
   async transaction<T>(fn: (state: PanelState) => T | Promise<T>): Promise<T> {
-    let result!: T;
-    this.chain = this.chain.then(async () => {
+    const operation = this.chain.then(async () => {
       const draft = clone(this.state);
-      result = await fn(draft);
+      const result = await fn(draft);
       this.state = draft;
+      return result;
     });
-    await this.chain;
-    return result;
+    this.chain = operation.then(() => undefined, () => undefined);
+    return operation;
   }
   async close(): Promise<void> {}
 }
@@ -75,17 +75,17 @@ export class PostgresStateStore implements StateStore {
   }
 
   async transaction<T>(fn: (state: PanelState) => T | Promise<T>): Promise<T> {
-    let result!: T;
-    this.chain = this.chain.then(async () => {
+    const operation = this.chain.then(async () => {
       const draft = clone(this.state);
-      result = await fn(draft);
+      const result = await fn(draft);
       await this.pool.query("UPDATE panel_state SET state = $1::jsonb, updated_at = now() WHERE id = 1", [
         JSON.stringify(draft)
       ]);
       this.state = draft;
+      return result;
     });
-    await this.chain;
-    return result;
+    this.chain = operation.then(() => undefined, () => undefined);
+    return operation;
   }
 
   async close(): Promise<void> {

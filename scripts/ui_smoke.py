@@ -1,5 +1,6 @@
 from pathlib import Path
 import os
+from time import sleep
 
 from playwright.sync_api import sync_playwright
 
@@ -20,7 +21,15 @@ with sync_playwright() as p:
     page.on("response", lambda response: failed_responses.append(f"{response.status} {response.url}") if response.status >= 400 else None)
     page.on("requestfailed", lambda request: failed_requests.append(f"{request.failure} {request.url}"))
 
-    page.goto(os.environ.get("PANEL_URL", "http://127.0.0.1:5273"), wait_until="networkidle")
+    panel_url = os.environ.get("PANEL_URL", "http://127.0.0.1:5173")
+    for attempt in range(30):
+        try:
+            page.goto(panel_url, wait_until="networkidle")
+            break
+        except Exception:
+            if attempt == 29:
+                raise
+            sleep(0.5)
     page.get_by_label("用户名").fill("panel-admin")
     page.get_by_label("密码").fill("CorrectHorseBatteryStaple1!")
     page.get_by_role("button", name="创建并进入面板").click()
@@ -60,6 +69,16 @@ with sync_playwright() as p:
     page.locator(".member-tool").wait_for()
     assert page.get_by_text("实例所有者", exact=False).is_visible()
     page.screenshot(path=str(ARTIFACTS / "control-panel-members.png"), full_page=True)
+    page.get_by_role("button", name="配置", exact=True).click()
+    page.locator(".config-tool").wait_for()
+    assert page.get_by_text("保存会保留实例数据目录", exact=False).is_visible()
+    page.get_by_role("button", name="添加变量", exact=True).click()
+    page.get_by_label("环境变量名称").fill("MOTD")
+    page.get_by_label("环境变量值").fill("Smoke checked")
+    page.get_by_label("我确认保存后会重建运行容器").check()
+    page.get_by_role("button", name="保存并重建", exact=True).click()
+    page.get_by_text("配置重建任务已提交", exact=False).wait_for()
+    page.screenshot(path=str(ARTIFACTS / "control-panel-config.png"), full_page=True)
     page.get_by_role("button", name="文件", exact=True).click()
     page.locator(".toast").click()
     page.screenshot(path=str(ARTIFACTS / "control-panel.png"), full_page=True)
@@ -69,6 +88,9 @@ with sync_playwright() as p:
     page.get_by_role("button", name="协作者", exact=True).click()
     page.locator(".member-tool").wait_for()
     page.screenshot(path=str(ARTIFACTS / "control-panel-members-mobile.png"), full_page=True)
+    page.get_by_role("button", name="配置", exact=True).click()
+    page.locator(".config-tool").wait_for()
+    page.screenshot(path=str(ARTIFACTS / "control-panel-config-mobile.png"), full_page=True)
     page.get_by_title("打开导航").click()
     page.get_by_role("button", name="节点").click()
     page.screenshot(path=str(ARTIFACTS / "control-panel-mobile.png"), full_page=True)

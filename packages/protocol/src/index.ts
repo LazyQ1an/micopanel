@@ -91,6 +91,7 @@ export type AgentOutboundMessage =
   | { type: "error"; message: string };
 
 export interface NodeUsage {
+  cpuCores: number;
   cpuPercent: number;
   memoryBytes: number;
   memoryLimitBytes: number;

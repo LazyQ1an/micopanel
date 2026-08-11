@@ -1,4 +1,4 @@
-import type { Permission, ServerKind, TaskType } from "@micopanel/protocol";
+import type { Permission, ResourceLimits, ServerKind, TaskType } from "@micopanel/protocol";
 import { ALL_INSTANCE_PERMISSIONS } from "@micopanel/protocol";
 import { getTemplate } from "./templates.js";
 import { Cron } from "croner";
@@ -18,6 +18,15 @@ import type {
 import type { StateStore } from "./store.js";
 
 const now = (): string => new Date().toISOString();
+
+export const MANAGED_ENVIRONMENT_KEYS = new Set(["EULA", "TYPE", "VERSION", "MEMORY", "CUSTOM_JAR"]);
+
+export interface InstanceConfigurationInput {
+  environment: Record<string, string>;
+  limits: ResourceLimits;
+  port: number;
+  version: string;
+}
 
 export const findUser = (state: PanelState, userId: string): User | undefined => state.users.find((user) => user.id === userId);
 
@@ -66,17 +75,39 @@ export const createNode = async (
   return { node, enrollmentToken };
 };
 
-const allocatePort = (state: PanelState, node: NodeRecord, protocol: "tcp" | "udp", requested?: number): number => {
+export const allocatePort = (
+  state: PanelState,
+  node: NodeRecord,
+  protocol: "tcp" | "udp",
+  requested?: number,
+  excludeInstanceId?: string
+): number => {
   const used = new Set(
     state.instances
-      .filter((instance) => instance.nodeId === node.id && instance.status !== "archived")
+      .filter((instance) => instance.nodeId === node.id && instance.status !== "archived" && instance.id !== excludeInstanceId)
       .flatMap((instance) => instance.ports.filter((port) => port.protocol === protocol).map((port) => port.host))
   );
-  if (requested && requested >= node.portRangeStart && requested <= node.portRangeEnd && !used.has(requested)) return requested;
+  if (requested !== undefined) {
+    if (requested < node.portRangeStart || requested > node.portRangeEnd) throw new Error("端口不在节点可分配范围内");
+    if (used.has(requested)) throw new Error("端口已被当前节点上的其他实例占用");
+    return requested;
+  }
   for (let port = node.portRangeStart; port <= node.portRangeEnd; port += 1) {
     if (!used.has(port)) return port;
   }
   throw new Error("节点没有可用端口");
+};
+
+export const managedEnvironment = (instance: Pick<InstanceRecord, "kind" | "environment">): Record<string, string> => {
+  const environment = { ...getTemplate(instance.kind).environment };
+  if (instance.kind === "custom" && instance.environment.CUSTOM_JAR) environment.CUSTOM_JAR = instance.environment.CUSTOM_JAR;
+  return environment;
+};
+
+export const configurableEnvironment = (instance: Pick<InstanceRecord, "kind" | "environment">): Record<string, string> => {
+  const locked = new Set(Object.keys(managedEnvironment(instance)));
+  for (const key of MANAGED_ENVIRONMENT_KEYS) locked.add(key);
+  return Object.fromEntries(Object.entries(instance.environment).filter(([key]) => !locked.has(key)));
 };
 
 export const createInstance = async (
@@ -93,9 +124,11 @@ export const createInstance = async (
     pids: number;
     port?: number;
     environment?: Record<string, string>;
+    customJar?: string;
   }
 ): Promise<InstanceRecord> => {
   const template = getTemplate(input.kind);
+  if (Object.keys(input.environment ?? {}).some((key) => MANAGED_ENVIRONMENT_KEYS.has(key))) throw new Error("不能修改受管环境变量");
   return store.transaction((state) => {
     const node = state.nodes.find((candidate) => candidate.id === input.nodeId);
     if (!node) throw new Error("节点不存在");
@@ -112,7 +145,7 @@ export const createInstance = async (
       status: "creating",
       limits: { memoryMb: input.memoryMb, cpuCores: input.cpuCores, diskMb: input.diskMb, pids: input.pids },
       ports: [{ host: allocatePort(state, node, template.protocol, input.port), container: template.defaultPort, protocol: template.protocol }],
-      environment: { ...template.environment, ...(input.environment ?? {}) },
+      environment: { ...template.environment, ...(input.environment ?? {}), ...(input.customJar ? { CUSTOM_JAR: input.customJar } : {}) },
       ownerId: actorId,
       console: [],
       files: {},
@@ -125,6 +158,30 @@ export const createInstance = async (
     return instance;
   });
 };
+
+export const updateInstanceConfiguration = async (
+  store: StateStore,
+  actorId: string,
+  instanceId: string,
+  input: InstanceConfigurationInput
+): Promise<InstanceRecord> =>
+  store.transaction((state) => {
+    const instance = state.instances.find((candidate) => candidate.id === instanceId);
+    if (!instance) throw new Error("实例不存在");
+    const node = state.nodes.find((candidate) => candidate.id === instance.nodeId);
+    if (!node) throw new Error("节点不存在");
+    const template = getTemplate(instance.kind);
+    const existingPort = instance.ports[0];
+    const protocol = existingPort?.protocol ?? template.protocol;
+    const container = existingPort?.container ?? template.defaultPort;
+    instance.environment = { ...managedEnvironment(instance), ...input.environment };
+    instance.limits = input.limits;
+    instance.version = input.version.trim();
+    instance.ports = [{ host: allocatePort(state, node, protocol, input.port, instance.id), container, protocol }];
+    instance.updatedAt = now();
+    addAudit(state, actorId, "instance.config.updated", instance.id, `port=${instance.ports[0].host}; memoryMb=${instance.limits.memoryMb}; cpuCores=${instance.limits.cpuCores}`);
+    return instance;
+  });
 
 export const createTask = async (
   store: StateStore,

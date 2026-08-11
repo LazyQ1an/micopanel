@@ -15,7 +15,7 @@ export interface Node {
   portRangeStart: number;
   portRangeEnd: number;
   lastSeenAt?: string;
-  usage?: { cpuPercent: number; memoryBytes: number; memoryLimitBytes: number; diskBytes: number; diskLimitBytes: number };
+  usage?: { cpuCores: number; cpuPercent: number; memoryBytes: number; memoryLimitBytes: number; diskBytes: number; diskLimitBytes: number };
 }
 
 export interface Instance {
@@ -111,6 +111,7 @@ export interface Dashboard {
 
 export interface InstanceDetail {
   instance: Instance;
+  configuration: { environment: Record<string, string>; managedEnvironment: Record<string, string> };
   console: string[];
   files: Array<{ path: string; size: number; modifiedAt: string; content?: string }>;
   backups: Backup[];

@@ -68,6 +68,19 @@ Administrators can also create a local collaborator account from the same panel.
 with configuration access cannot delegate access to other users: membership changes remain
 restricted to the instance owner or an administrator and are recorded in the audit log.
 
+## Instance configuration
+
+The instance workspace provides a controlled configuration operation for server version, game
+port, CPU, memory, PID, data-capacity settings, and additional environment variables. Applying a
+configuration requires an explicit confirmation because the Agent stops and recreates the managed
+container while preserving its `/data` directory. Host ports are reserved from the node pool in
+the same control-plane transaction, so a requested conflicting or out-of-range port is rejected
+rather than silently remapped.
+
+Only additional environment variables are editable. Template-defined server type, Mojang EULA,
+runtime version and memory values, and a trusted custom JAR entry are panel-managed and cannot be
+overridden through the browser or API configuration request.
+
 ## Security baseline
 
 - Browser sessions use signed, HttpOnly cookies.

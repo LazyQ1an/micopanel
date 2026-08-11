@@ -66,7 +66,7 @@ import type { Permission } from "@micopanel/protocol";
 type Screen =
   "overview" | "instances" | "nodes" | "tasks" | "backups" | "audit";
 type Modal = "node" | "instance" | null;
-type DetailTab = "console" | "files" | "backups" | "schedules" | "members";
+type DetailTab = "console" | "config" | "files" | "backups" | "schedules" | "members";
 
 const permissionLabels: Record<Permission, string> = {
   "instance.view": "查看实例",
@@ -503,6 +503,7 @@ function ControlPanel({
                 key={selected.id}
                 detail={detail}
                 instance={selected}
+                node={dashboard.nodes.find((node) => node.id === selected.nodeId)}
                 onAction={action}
                 notify={setMessage}
                 reload={() => {
@@ -1090,12 +1091,14 @@ function Audit({
 function InstanceWorkspace({
   detail,
   instance,
+  node,
   onAction,
   notify,
   reload,
 }: {
   detail?: InstanceDetail;
   instance: Instance;
+  node?: Node;
   onAction: (
     instance: Instance,
     action: "start" | "stop" | "restart" | "kill" | "command",
@@ -1360,7 +1363,7 @@ function InstanceWorkspace({
         </div>
       </div>
       <div className="detail-tabs">
-        {(["console", "files", "backups", "schedules", "members"] as DetailTab[]).map(
+        {(["console", "config", "files", "backups", "schedules", "members"] as DetailTab[]).map(
           (item) => (
             <button
               key={item}
@@ -1372,7 +1375,9 @@ function InstanceWorkspace({
             >
               {item === "console"
                 ? "控制台"
-                : item === "files"
+                : item === "config"
+                  ? "配置"
+                  : item === "files"
                   ? "文件"
                   : item === "backups"
                     ? "备份"
@@ -1409,6 +1414,7 @@ function InstanceWorkspace({
           </form>
         </div>
       )}
+      {tab === "config" && <ConfigurationTool detail={detail} instance={instance} node={node} notify={notify} reload={reload} />}
       {tab === "files" && (
         <div className="file-tool file-manager">
           <div className="tool-title">
@@ -1649,6 +1655,155 @@ function InstanceWorkspace({
         </div>
       )}
     </section>
+  );
+}
+
+type EnvironmentEntry = { id: string; key: string; value: string };
+
+function ConfigurationTool({
+  detail,
+  instance,
+  node,
+  notify,
+  reload,
+}: {
+  detail?: InstanceDetail;
+  instance: Instance;
+  node?: Node;
+  notify: (message?: string) => void;
+  reload: () => void;
+}) {
+  const [version, setVersion] = useState(instance.version);
+  const [port, setPort] = useState(instance.ports[0]?.host ?? 25565);
+  const [limits, setLimits] = useState(instance.limits);
+  const [environment, setEnvironment] = useState<EnvironmentEntry[]>([]);
+  const [confirmed, setConfirmed] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const appliedAt = detail?.instance.updatedAt;
+
+  useEffect(() => {
+    const editable = detail?.configuration.environment ?? {};
+    setVersion(detail?.instance.version ?? instance.version);
+    setPort(detail?.instance.ports[0]?.host ?? instance.ports[0]?.host ?? 25565);
+    setLimits(detail?.instance.limits ?? instance.limits);
+    setEnvironment(Object.entries(editable).map(([key, value], index) => ({ id: `${key}-${index}`, key, value })));
+    setConfirmed(false);
+  }, [appliedAt, detail?.configuration.environment, instance.id]);
+
+  const updateLimit = (key: keyof Instance["limits"], value: number) => {
+    setLimits((current) => ({ ...current, [key]: value }));
+  };
+  const updateEnvironment = (id: string, field: "key" | "value", value: string) => {
+    setEnvironment((current) => current.map((entry) => entry.id === id ? { ...entry, [field]: value } : entry));
+  };
+  const save = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!confirmed) {
+      notify("请先确认将重建运行容器");
+      return;
+    }
+    const nextEnvironment: Record<string, string> = {};
+    for (const entry of environment) {
+      const key = entry.key.trim();
+      if (!key) continue;
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+        notify("环境变量名称只能包含字母、数字和下划线");
+        return;
+      }
+      if (key in nextEnvironment) {
+        notify("环境变量名称不能重复");
+        return;
+      }
+      nextEnvironment[key] = entry.value;
+    }
+    setSaving(true);
+    try {
+      await api(`/api/instances/${instance.id}/config`, {
+        method: "PUT",
+        body: JSON.stringify({ version, port, limits, environment: nextEnvironment, confirmRecreate: true }),
+      });
+      notify("配置重建任务已提交，容器将在节点端重新创建");
+      reload();
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "实例配置未保存");
+    } finally {
+      setSaving(false);
+    }
+  };
+  const managed = detail?.configuration.managedEnvironment ?? {};
+  const mappedPort = instance.ports[0];
+  return (
+    <div className="config-tool">
+      <div className="tool-title">
+        <span><Settings2 size={18} /> 运行配置</span>
+        <span className="config-node">{node ? `${node.name} ${node.portRangeStart}-${node.portRangeEnd}` : "等待节点信息"}</span>
+      </div>
+      <form className="config-form" onSubmit={save}>
+        <div className="config-recreate">
+          <CircleAlert size={17} />
+          <span>保存会保留实例数据目录，但会停止并重新创建受管容器。</span>
+        </div>
+        <section className="config-section">
+          <div className="config-section-heading"><Server size={16} /><span>服务端与网络</span></div>
+          <div className="config-grid">
+            <label>
+              服务端版本
+              <input value={version} maxLength={64} required onChange={(event) => setVersion(event.target.value)} />
+            </label>
+            <label>
+              游戏端口
+              <input type="number" value={port} min={node?.portRangeStart ?? 1024} max={node?.portRangeEnd ?? 65535} required onChange={(event) => setPort(Number(event.target.value))} />
+              <small>容器 {mappedPort?.container ?? 25565}/{mappedPort?.protocol ?? "tcp"}</small>
+            </label>
+          </div>
+        </section>
+        <section className="config-section">
+          <div className="config-section-heading"><HardDrive size={16} /><span>资源预留</span></div>
+          <div className="config-grid config-grid-four">
+            <label>
+              内存 MB
+              <input type="number" value={limits.memoryMb} min="512" max="262144" required onChange={(event) => updateLimit("memoryMb", Number(event.target.value))} />
+            </label>
+            <label>
+              vCPU
+              <input type="number" value={limits.cpuCores} min="0.25" max="128" step="0.25" required onChange={(event) => updateLimit("cpuCores", Number(event.target.value))} />
+            </label>
+            <label>
+              PID 上限
+              <input type="number" value={limits.pids} min="64" max="32768" required onChange={(event) => updateLimit("pids", Number(event.target.value))} />
+            </label>
+            <label>
+              数据容量 MB
+              <input type="number" value={limits.diskMb} min="1024" max="10485760" required onChange={(event) => updateLimit("diskMb", Number(event.target.value))} />
+            </label>
+          </div>
+        </section>
+        <section className="config-section">
+          <div className="config-section-heading"><Command size={16} /><span>环境变量</span></div>
+          <p className="config-note">仅保存额外变量。服务端模板、EULA、版本、内存和自定义入口由面板锁定。</p>
+          <div className="environment-list">
+            {environment.map((entry) => (
+              <div className="environment-row" key={entry.id}>
+                <input aria-label="环境变量名称" value={entry.key} maxLength={128} placeholder="MOTD" onChange={(event) => updateEnvironment(entry.id, "key", event.target.value)} />
+                <input aria-label="环境变量值" value={entry.value} maxLength={4096} placeholder="欢迎来到服务器" onChange={(event) => updateEnvironment(entry.id, "value", event.target.value)} />
+                <button className="icon-button" type="button" title="移除环境变量" onClick={() => setEnvironment((current) => current.filter((candidate) => candidate.id !== entry.id))}><Trash2 size={15} /></button>
+              </div>
+            ))}
+          </div>
+          <button className="button compact" type="button" onClick={() => setEnvironment((current) => [...current, { id: `new-${Date.now()}`, key: "", value: "" }])}><Plus size={15} /> 添加变量</button>
+          {!!Object.keys(managed).length && <div className="managed-environment"><span>受管变量</span>{Object.entries(managed).map(([key, value]) => <code key={key}>{key}={value}</code>)}</div>}
+        </section>
+        <div className="config-save-row">
+          <label className="check-row">
+            <input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />
+            我确认保存后会重建运行容器
+          </label>
+          <button className="button primary" disabled={saving || !confirmed}>
+            {saving ? <LoaderCircle size={16} className="spin" /> : <Save size={16} />} 保存并重建
+          </button>
+        </div>
+      </form>
+    </div>
   );
 }
 

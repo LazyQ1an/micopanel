@@ -66,6 +66,35 @@ test("control plane bootstraps, queues workloads, and archives safely", async ()
     assert.equal(instanceBody.task.type, "instance.create");
     assert.equal(instanceBody.instance.ports[0].host, 25565);
 
+    const configWithoutConfirmation = await app.inject({
+      method: "PUT",
+      url: `/api/instances/${instanceBody.instance.id}/config`,
+      headers: { cookie, "content-type": "application/json" },
+      payload: JSON.stringify({ version: "1.21.4", port: 25566, environment: { MOTD: "MicoPanel" }, limits: { memoryMb: 2048, cpuCores: 1, diskMb: 4096, pids: 256 } })
+    });
+    assert.equal(configWithoutConfirmation.statusCode, 422);
+    const configWithManagedVariable = await app.inject({
+      method: "PUT",
+      url: `/api/instances/${instanceBody.instance.id}/config`,
+      headers: { cookie, "content-type": "application/json" },
+      payload: JSON.stringify({ version: "1.21.4", port: 25566, environment: { EULA: "FALSE" }, limits: { memoryMb: 2048, cpuCores: 1, diskMb: 4096, pids: 256 }, confirmRecreate: true })
+    });
+    assert.equal(configWithManagedVariable.statusCode, 422);
+    const configUpdate = await app.inject({
+      method: "PUT",
+      url: `/api/instances/${instanceBody.instance.id}/config`,
+      headers: { cookie, "content-type": "application/json" },
+      payload: JSON.stringify({ version: "1.21.5", port: 25566, environment: { MOTD: "MicoPanel" }, limits: { memoryMb: 3072, cpuCores: 1.5, diskMb: 8192, pids: 320 }, confirmRecreate: true })
+    });
+    assert.equal(configUpdate.statusCode, 202);
+    const configBody = configUpdate.json() as { instance: { version: string; ports: Array<{ host: number }>; limits: { memoryMb: number; pids: number }; environment: Record<string, string> }; configuration: { environment: Record<string, string>; managedEnvironment: Record<string, string> } };
+    assert.equal(configBody.instance.version, "1.21.5");
+    assert.equal(configBody.instance.ports[0].host, 25566);
+    assert.equal(configBody.instance.limits.memoryMb, 3072);
+    assert.equal(configBody.instance.limits.pids, 320);
+    assert.equal(configBody.configuration.environment.MOTD, "MicoPanel");
+    assert.equal(configBody.configuration.managedEnvironment.EULA, "TRUE");
+
     const syncFiles = await app.inject({ method: "POST", url: `/api/instances/${instanceBody.instance.id}/files/sync`, headers: { cookie } });
     assert.equal(syncFiles.statusCode, 202);
     assert.equal(syncFiles.json().task.type, "file.list");
@@ -138,6 +167,13 @@ test("control plane bootstraps, queues workloads, and archives safely", async ()
     assert.equal(collaboratorView.statusCode, 200);
     const collaboratorFileAccess = await app.inject({ method: "GET", url: `/api/instances/${instanceBody.instance.id}/files`, headers: { cookie: collaboratorCookie } });
     assert.equal(collaboratorFileAccess.statusCode, 403);
+    const collaboratorConfigUpdate = await app.inject({
+      method: "PUT",
+      url: `/api/instances/${instanceBody.instance.id}/config`,
+      headers: { cookie: collaboratorCookie, "content-type": "application/json" },
+      payload: JSON.stringify({ version: "1.21.5", port: 25566, environment: { MOTD: "Builder managed" }, limits: { memoryMb: 3072, cpuCores: 1.5, diskMb: 8192, pids: 320 }, confirmRecreate: true })
+    });
+    assert.equal(collaboratorConfigUpdate.statusCode, 202);
     const collaboratorMemberWrite = await app.inject({
       method: "PUT",
       url: `/api/instances/${instanceBody.instance.id}/members/${collaborator.id}`,
@@ -170,6 +206,14 @@ test("control plane bootstraps, queues workloads, and archives safely", async ()
     assert.equal(custom.statusCode, 202);
     const artifactTask = (await store.read()).tasks.find((task) => task.instanceId === custom.json().instance.id)!;
     assert.equal(typeof (artifactTask.payload.artifact as { token?: unknown }).token, "string");
+    const portConflict = await app.inject({
+      method: "PUT",
+      url: `/api/instances/${instanceBody.instance.id}/config`,
+      headers: { cookie, "content-type": "application/json" },
+      payload: JSON.stringify({ version: "1.21.5", port: 25565, environment: { MOTD: "Collision" }, limits: { memoryMb: 3072, cpuCores: 1.5, diskMb: 8192, pids: 320 }, confirmRecreate: true })
+    });
+    assert.equal(portConflict.statusCode, 409);
+    assert.equal((await store.read()).audits.some((audit) => audit.action === "instance.config.updated"), true);
 
     const backup = await app.inject({ method: "POST", url: `/api/instances/${instanceBody.instance.id}/backups`, headers: { cookie, "content-type": "application/json" }, payload: JSON.stringify({ destination: "local" }) });
     assert.equal(backup.statusCode, 202);

@@ -522,6 +522,7 @@ export class DockerRuntime {
     }
     const diskLimitBytes = filesystem.blocks * filesystem.bsize;
     return {
+      cpuCores: cpus().length,
       cpuPercent: Math.min(100, (loadavg()[0] / Math.max(1, cpus().length)) * 100),
       memoryBytes: totalmem() - freemem(),
       memoryLimitBytes: totalmem(),
