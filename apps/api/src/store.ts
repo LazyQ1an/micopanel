@@ -10,6 +10,15 @@ export interface StateStore {
 
 const clone = (state: PanelState): PanelState => structuredClone(state);
 
+const normalizeState = (state: PanelState): PanelState => {
+  for (const instance of state.instances) {
+    instance.console ??= [];
+    instance.files ??= {};
+    instance.fileIndex ??= [];
+  }
+  return state;
+};
+
 export class MemoryStore implements StateStore {
   private state = createEmptyState();
   private chain = Promise.resolve();
@@ -51,7 +60,8 @@ export class PostgresStateStore implements StateStore {
     `);
     const result = await this.pool.query<{ state: PanelState }>("SELECT state FROM panel_state WHERE id = 1");
     if (result.rowCount) {
-      this.state = result.rows[0].state;
+      this.state = normalizeState(result.rows[0].state);
+      await this.pool.query("UPDATE panel_state SET state = $1::jsonb, updated_at = now() WHERE id = 1", [JSON.stringify(this.state)]);
       return;
     }
     await this.pool.query("INSERT INTO panel_state (id, state) VALUES (1, $1::jsonb)", [JSON.stringify(this.state)]);
@@ -83,4 +93,3 @@ export class PostgresStateStore implements StateStore {
 
 export const createStore = (databaseUrl?: string): StateStore =>
   databaseUrl ? new PostgresStateStore(databaseUrl) : new MemoryStore();
-

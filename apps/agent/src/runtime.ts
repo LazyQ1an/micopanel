@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { createReadStream, createWriteStream, existsSync } from "node:fs";
-import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, relative, resolve } from "node:path";
 import { PassThrough, type Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -68,6 +68,26 @@ export class DockerRuntime {
     const pathFromRoot = relative(root, target);
     if (pathFromRoot.startsWith("..") || pathFromRoot === "" && requestedPath !== "/") throw new Error("Unsafe file path");
     return target;
+  }
+
+  private async listFiles(instanceId: string): Promise<Array<{ path: string; size: number; modifiedAt: string }>> {
+    const root = this.instancePath(instanceId);
+    const files: Array<{ path: string; size: number; modifiedAt: string }> = [];
+    const visit = async (directory: string): Promise<void> => {
+      if (files.length >= 2000) return;
+      const entries = await readdir(directory, { withFileTypes: true });
+      for (const entry of entries) {
+        if (files.length >= 2000 || entry.isSymbolicLink()) continue;
+        const absolute = resolve(directory, entry.name);
+        if (entry.isDirectory()) await visit(absolute);
+        else if (entry.isFile()) {
+          const metadata = await stat(absolute);
+          files.push({ path: `/${relative(root, absolute).replaceAll("\\", "/")}`, size: metadata.size, modifiedAt: metadata.mtime.toISOString() });
+        }
+      }
+    };
+    await visit(root);
+    return files.sort((left, right) => left.path.localeCompare(right.path));
   }
 
   private async inspectOrUndefined(instanceId: string) {
@@ -146,7 +166,10 @@ export class DockerRuntime {
       await existing.remove({ force: true });
     }
     await mkdir(this.instancePath(instance.id), { recursive: true });
-    await this.docker.pull(instance.image);
+    const pullStream = await this.docker.pull(instance.image);
+    await new Promise<void>((resolvePromise, reject) => {
+      this.docker.modem.followProgress(pullStream, (error) => error ? reject(error) : resolvePromise());
+    });
     const container = await this.docker.createContainer(this.containerOptions(instance));
     await container.start();
     await this.ensureConsole(instance.id);
@@ -257,11 +280,14 @@ export class DockerRuntime {
       }
       case "file.read": {
         const path = String(task.payload.path ?? "");
-        const content = await readFile(this.safeFilePath(task.instanceId!, path), "utf8");
+        const target = this.safeFilePath(task.instanceId!, path);
+        const metadata = await stat(target);
+        if (metadata.size > 1_000_000) throw new Error("文件超过 1 MB，不能在面板编辑器中打开");
+        const content = await readFile(target, "utf8");
         return { message: `已读取 ${path}`, data: { content } };
       }
       case "file.list": {
-        return { message: "文件目录已同步" };
+        return { message: "文件目录已同步", data: { files: await this.listFiles(task.instanceId!) } };
       }
       case "instance.backup": {
         if (!instance) throw new Error("Backup task did not include an instance spec");

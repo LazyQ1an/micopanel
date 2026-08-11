@@ -59,6 +59,10 @@ test("control plane bootstraps, queues workloads, and archives safely", async ()
     assert.equal(instanceBody.task.type, "instance.create");
     assert.equal(instanceBody.instance.ports[0].host, 25565);
 
+    const syncFiles = await app.inject({ method: "POST", url: `/api/instances/${instanceBody.instance.id}/files/sync`, headers: { cookie } });
+    assert.equal(syncFiles.statusCode, 202);
+    assert.equal(syncFiles.json().task.type, "file.list");
+
     const backup = await app.inject({ method: "POST", url: `/api/instances/${instanceBody.instance.id}/backups`, headers: { cookie, "content-type": "application/json" }, payload: JSON.stringify({ destination: "local" }) });
     assert.equal(backup.statusCode, 202);
     const backupBody = backup.json() as { backup: { id: string } };

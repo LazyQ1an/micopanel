@@ -81,8 +81,8 @@ export interface Dashboard {
 export interface InstanceDetail {
   instance: Instance;
   console: string[];
+  files: Array<{ path: string; size: number; modifiedAt: string; content?: string }>;
   backups: Backup[];
   schedules: Schedule[];
   members: Array<{ instanceId: string; userId: string; permissions: Permission[] }>;
 }
-

@@ -35,7 +35,7 @@ import {
 } from "./service.js";
 import { createStore, type StateStore } from "./store.js";
 import { SERVER_TEMPLATES } from "./templates.js";
-import type { BackupRecord, InstanceRecord, NodeRecord, ScheduleRecord, TaskRecord, User } from "./types.js";
+import type { BackupRecord, InstanceRecord, ManagedFile, NodeRecord, ScheduleRecord, TaskRecord, User } from "./types.js";
 
 type SocketLike = {
   readyState: number;
@@ -106,7 +106,8 @@ const scheduleSchema = z.object({
 });
 const memberSchema = z.object({ permissions: z.array(z.enum(ALL_INSTANCE_PERMISSIONS)).min(1) });
 const userSchema = z.object({ username: z.string().min(3).max(32), password: z.string().min(10).max(128), role: z.enum(["admin", "user"]).default("user") });
-const fileSchema = z.object({ path: z.string().min(1).max(512).refine((path) => !path.includes("..") && path.startsWith("/"), "文件路径无效"), content: z.string().max(10_000_000) });
+const filePathSchema = z.object({ path: z.string().min(1).max(512).refine((path) => !path.includes("..") && path.startsWith("/"), "文件路径无效") });
+const fileSchema = filePathSchema.extend({ content: z.string().max(10_000_000) });
 
 export async function buildServer(options?: { config?: AppConfig; store?: StateStore }) {
   const config = options?.config ?? loadConfig();
@@ -241,6 +242,16 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
           backup.sizeBytes = Number(message.data?.sizeBytes) || undefined;
           backup.checksum = typeof message.data?.checksum === "string" ? message.data.checksum : undefined;
         }
+      }
+      if (task.type === "file.list" && instance && Array.isArray(message.data?.files)) {
+        instance.fileIndex = message.data.files
+          .filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === "object")
+          .filter((entry) => typeof entry.path === "string" && typeof entry.size === "number" && typeof entry.modifiedAt === "string")
+          .slice(0, 2000)
+          .map((entry) => ({ path: entry.path as string, size: entry.size as number, modifiedAt: entry.modifiedAt as string } satisfies ManagedFile));
+      }
+      if (task.type === "file.read" && instance && typeof task.payload.path === "string" && typeof message.data?.content === "string") {
+        instance.files[task.payload.path] = message.data.content;
       }
       addAudit(state, "agent", message.ok ? "task.succeeded" : "task.failed", task.id, message.message);
     });
@@ -484,6 +495,7 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
       instance: instancePublic(access.instance),
       members: state.members.filter((member) => member.instanceId === access.instance!.id),
       console: access.instance.console,
+      files: access.instance.fileIndex,
       backups: state.backups.filter((backup) => backup.instanceId === access.instance!.id),
       schedules: state.schedules.filter((schedule) => schedule.instanceId === access.instance!.id)
     };
@@ -528,8 +540,23 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
     const access = await getInstanceAccess(request, reply, "instance.files");
     if (!access.user || !access.instance) return access.response;
     const path = typeof (request.query as { path?: string }).path === "string" ? (request.query as { path: string }).path : "/";
-    const files = Object.entries(access.instance.files).filter(([filePath]) => filePath.startsWith(path)).map(([filePath, content]) => ({ path: filePath, size: Buffer.byteLength(content), content }));
+    const files = access.instance.fileIndex.filter((file) => file.path.startsWith(path)).map((file) => ({ ...file, content: access.instance!.files[file.path] }));
     return { files };
+  });
+
+  app.post("/api/instances/:id/files/sync", async (request, reply) => {
+    const access = await getInstanceAccess(request, reply, "instance.files");
+    if (!access.user || !access.instance) return access.response;
+    const task = await enqueue(access.user.id, { type: "file.list", nodeId: access.instance.nodeId, instanceId: access.instance.id });
+    return reply.code(202).send({ task: taskPublic(task) });
+  });
+
+  app.post("/api/instances/:id/files/read", async (request, reply) => {
+    const access = await getInstanceAccess(request, reply, "instance.files");
+    if (!access.user || !access.instance) return access.response;
+    const input = filePathSchema.parse(request.body);
+    const task = await enqueue(access.user.id, { type: "file.read", nodeId: access.instance.nodeId, instanceId: access.instance.id, payload: input });
+    return reply.code(202).send({ task: taskPublic(task) });
   });
 
   app.put("/api/instances/:id/files", async (request, reply) => {
@@ -539,6 +566,10 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
     const instance = await store.transaction((state) => {
       const target = state.instances.find((candidate) => candidate.id === access.instance!.id)!;
       target.files[input.path] = input.content;
+      const index = target.fileIndex.findIndex((file) => file.path === input.path);
+      const record: ManagedFile = { path: input.path, size: Buffer.byteLength(input.content), modifiedAt: now() };
+      if (index >= 0) target.fileIndex[index] = record;
+      else target.fileIndex.push(record);
       target.updatedAt = now();
       addAudit(state, access.user!.id, "file.write", `${target.id}:${input.path}`);
       return target;

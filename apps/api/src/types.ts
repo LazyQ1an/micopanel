@@ -39,6 +39,13 @@ export interface InstanceRecord extends InstanceSpec {
   lastError?: string;
   console: string[];
   files: Record<string, string>;
+  fileIndex: ManagedFile[];
+}
+
+export interface ManagedFile {
+  path: string;
+  size: number;
+  modifiedAt: string;
 }
 
 export interface InstanceMember {
@@ -117,4 +124,3 @@ export const createEmptyState = (): PanelState => ({
   schedules: [],
   audits: []
 });
-

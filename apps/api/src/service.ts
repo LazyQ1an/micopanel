@@ -116,6 +116,7 @@ export const createInstance = async (
       ownerId: actorId,
       console: [],
       files: {},
+      fileIndex: [],
       createdAt: now(),
       updatedAt: now()
     };
