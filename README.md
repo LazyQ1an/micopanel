@@ -59,6 +59,15 @@ transfer. Each transfer has a task-scoped token; expired, failed, and completed-
 files are removed automatically. Instance collaborators still require the `instance.files`
 permission for every file route.
 
+## Collaborators
+
+Every instance has an owner. The owner and panel administrators can add, edit, or remove
+collaborators directly in the instance workspace, selecting only the permissions required for
+viewing, console commands, power operations, files, configuration, backups, or schedules.
+Administrators can also create a local collaborator account from the same panel. A collaborator
+with configuration access cannot delegate access to other users: membership changes remain
+restricted to the instance owner or an administrator and are recorded in the audit log.
+
 ## Security baseline
 
 - Browser sessions use signed, HttpOnly cookies.
@@ -67,4 +76,5 @@ permission for every file route.
 - Agents maintain outbound WebSocket connections and never publish the Docker socket.
 - Custom package downloads are authorized with short-lived tokens and are verified by SHA-256
   when stored by the control plane.
+- Instance membership changes are owner/admin-only and are recorded in the audit log.
 - Every destructive or control operation is written to the audit log.

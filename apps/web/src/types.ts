@@ -86,6 +86,21 @@ export interface FileTransfer {
   error?: string;
 }
 
+export interface InstanceMember {
+  instanceId: string;
+  userId: string;
+  permissions: Permission[];
+  user: User;
+}
+
+export interface MemberDirectory {
+  owner: User;
+  members: InstanceMember[];
+  users: User[];
+  canManage: boolean;
+  canCreateUsers: boolean;
+}
+
 export interface Dashboard {
   instances: Instance[];
   nodes: Node[];

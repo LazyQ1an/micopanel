@@ -15,8 +15,10 @@ with sync_playwright() as p:
     page = browser.new_page(viewport={"width": 1440, "height": 960})
     errors = []
     failed_responses = []
+    failed_requests = []
     page.on("console", lambda message: errors.append(message.text) if message.type == "error" else None)
     page.on("response", lambda response: failed_responses.append(f"{response.status} {response.url}") if response.status >= 400 else None)
+    page.on("requestfailed", lambda request: failed_requests.append(f"{request.failure} {request.url}"))
 
     page.goto(os.environ.get("PANEL_URL", "http://127.0.0.1:5273"), wait_until="networkidle")
     page.get_by_label("用户名").fill("panel-admin")
@@ -54,13 +56,22 @@ with sync_playwright() as p:
     assert page.get_by_title("上传到当前目录").is_visible()
     assert page.get_by_title("刷新文件").is_visible()
     page.locator(".toast").click()
+    page.get_by_role("button", name="协作者", exact=True).click()
+    page.locator(".member-tool").wait_for()
+    assert page.get_by_text("实例所有者", exact=False).is_visible()
+    page.screenshot(path=str(ARTIFACTS / "control-panel-members.png"), full_page=True)
+    page.get_by_role("button", name="文件", exact=True).click()
+    page.locator(".toast").click()
     page.screenshot(path=str(ARTIFACTS / "control-panel.png"), full_page=True)
     page.set_viewport_size({"width": 390, "height": 844})
     page.locator(".file-manager").wait_for()
     page.screenshot(path=str(ARTIFACTS / "control-panel-files-mobile.png"), full_page=True)
+    page.get_by_role("button", name="协作者", exact=True).click()
+    page.locator(".member-tool").wait_for()
+    page.screenshot(path=str(ARTIFACTS / "control-panel-members-mobile.png"), full_page=True)
     page.get_by_title("打开导航").click()
     page.get_by_role("button", name="节点").click()
     page.screenshot(path=str(ARTIFACTS / "control-panel-mobile.png"), full_page=True)
 
-    assert not errors, f"Browser console errors: {errors}; failed responses: {failed_responses}"
+    assert not errors, f"Browser console errors: {errors}; failed responses: {failed_responses}; failed requests: {failed_requests}"
     browser.close()

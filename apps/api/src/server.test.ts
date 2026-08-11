@@ -112,6 +112,44 @@ test("control plane bootstraps, queues workloads, and archives safely", async ()
     assert.equal(browserDownload.statusCode, 200);
     assert.equal(browserDownload.body, "node log content");
 
+    const collaboratorAccount = await app.inject({
+      method: "POST",
+      url: "/api/users",
+      headers: { cookie, "content-type": "application/json" },
+      payload: JSON.stringify({ username: "builder", password: "correct-builder-123" })
+    });
+    assert.equal(collaboratorAccount.statusCode, 201);
+    const collaborator = collaboratorAccount.json().user as { id: string; username: string };
+    const membersBefore = await app.inject({ method: "GET", url: `/api/instances/${instanceBody.instance.id}/members`, headers: { cookie } });
+    assert.equal(membersBefore.statusCode, 200);
+    assert.equal(membersBefore.json().canManage, true);
+    assert.equal(membersBefore.json().users.some((user: { id: string }) => user.id === collaborator.id), true);
+    const memberWrite = await app.inject({
+      method: "PUT",
+      url: `/api/instances/${instanceBody.instance.id}/members/${collaborator.id}`,
+      headers: { cookie, "content-type": "application/json" },
+      payload: JSON.stringify({ permissions: ["instance.view", "instance.config"] })
+    });
+    assert.equal(memberWrite.statusCode, 200);
+    const collaboratorLogin = await app.inject({ method: "POST", url: "/api/auth/login", ...json({ username: "builder", password: "correct-builder-123" }) });
+    assert.equal(collaboratorLogin.statusCode, 200);
+    const collaboratorCookie = String(collaboratorLogin.headers["set-cookie"]).split(";")[0];
+    const collaboratorView = await app.inject({ method: "GET", url: `/api/instances/${instanceBody.instance.id}`, headers: { cookie: collaboratorCookie } });
+    assert.equal(collaboratorView.statusCode, 200);
+    const collaboratorFileAccess = await app.inject({ method: "GET", url: `/api/instances/${instanceBody.instance.id}/files`, headers: { cookie: collaboratorCookie } });
+    assert.equal(collaboratorFileAccess.statusCode, 403);
+    const collaboratorMemberWrite = await app.inject({
+      method: "PUT",
+      url: `/api/instances/${instanceBody.instance.id}/members/${collaborator.id}`,
+      headers: { cookie: collaboratorCookie, "content-type": "application/json" },
+      payload: JSON.stringify({ permissions: ["instance.view"] })
+    });
+    assert.equal(collaboratorMemberWrite.statusCode, 403);
+    const memberRemove = await app.inject({ method: "DELETE", url: `/api/instances/${instanceBody.instance.id}/members/${collaborator.id}`, headers: { cookie } });
+    assert.equal(memberRemove.statusCode, 204);
+    const collaboratorAfterRemove = await app.inject({ method: "GET", url: `/api/instances/${instanceBody.instance.id}`, headers: { cookie: collaboratorCookie } });
+    assert.equal(collaboratorAfterRemove.statusCode, 403);
+
     const missingArtifact = await app.inject({
       method: "POST",
       url: "/api/instances",

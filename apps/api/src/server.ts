@@ -185,6 +185,17 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
     return { user, instance };
   };
 
+  const getInstanceManagerAccess = async (request: FastifyRequest, reply: FastifyReply) => {
+    const user = await getCurrentUser(request);
+    if (!user) return { user: undefined, instance: undefined, response: unauthenticated(reply) };
+    const instanceId = (request.params as { id: string }).id;
+    const state = await store.read();
+    const instance = state.instances.find((candidate) => candidate.id === instanceId);
+    if (!instance) return { user: undefined, instance: undefined, response: notFound(reply, "实例不存在") };
+    if (!isAdmin(user) && instance.ownerId !== user.id) return { user: undefined, instance: undefined, response: forbidden(reply) };
+    return { user, instance };
+  };
+
   const deliverTask = async (taskId: string): Promise<void> => {
     const snapshot = await store.read();
     const task = snapshot.tasks.find((candidate) => candidate.id === taskId);
@@ -682,6 +693,22 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
     };
   });
 
+  app.get("/api/instances/:id/members", async (request, reply) => {
+    const access = await getInstanceAccess(request, reply, "instance.view");
+    if (!access.user || !access.instance) return access.response;
+    const state = await store.read();
+    const canManage = isAdmin(access.user) || access.instance.ownerId === access.user.id;
+    return {
+      owner: userPublic(state.users.find((candidate) => candidate.id === access.instance!.ownerId)!),
+      members: state.members
+        .filter((member) => member.instanceId === access.instance!.id)
+        .map((member) => ({ ...member, user: userPublic(state.users.find((candidate) => candidate.id === member.userId)!) })),
+      users: canManage ? state.users.filter((candidate) => candidate.id !== access.instance!.ownerId).map(userPublic) : [],
+      canManage,
+      canCreateUsers: canManage && isAdmin(access.user)
+    };
+  });
+
   app.post("/api/instances/:id/actions", async (request, reply) => {
     const input = actionSchema.parse(request.body);
     const permission: Permission = input.action === "command" ? "instance.console" : "instance.power";
@@ -936,23 +963,40 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
   });
 
   app.put("/api/instances/:id/members/:userId", async (request, reply) => {
-    const access = await getInstanceAccess(request, reply, "instance.config");
+    const access = await getInstanceManagerAccess(request, reply);
     if (!access.user || !access.instance) return access.response;
     const input = memberSchema.parse(request.body);
     const targetUserId = (request.params as { userId: string }).userId;
+    if (targetUserId === access.instance.ownerId) return reply.code(422).send({ error: "实例所有者不需要添加为协作者" });
+    if (!(await store.read()).users.some((user) => user.id === targetUserId)) return notFound(reply, "协作者不存在");
     const member = await store.transaction((state) => {
-      if (!state.users.some((user) => user.id === targetUserId)) throw new Error("协作者不存在");
       const existing = state.members.find((candidate) => candidate.instanceId === access.instance!.id && candidate.userId === targetUserId);
       if (existing) {
         existing.permissions = input.permissions;
+        addAudit(state, access.user!.id, "instance.member.updated", `${access.instance!.id}:${targetUserId}`, input.permissions.join(","));
         return existing;
       }
       const created = { instanceId: access.instance!.id, userId: targetUserId, permissions: input.permissions };
       state.members.push(created);
-      addAudit(state, access.user!.id, "instance.member.updated", `${access.instance!.id}:${targetUserId}`);
+      addAudit(state, access.user!.id, "instance.member.added", `${access.instance!.id}:${targetUserId}`, input.permissions.join(","));
       return created;
     });
     return { member };
+  });
+
+  app.delete("/api/instances/:id/members/:userId", async (request, reply) => {
+    const access = await getInstanceManagerAccess(request, reply);
+    if (!access.user || !access.instance) return access.response;
+    const targetUserId = (request.params as { userId: string }).userId;
+    const removed = await store.transaction((state) => {
+      const index = state.members.findIndex((member) => member.instanceId === access.instance!.id && member.userId === targetUserId);
+      if (index < 0) return false;
+      state.members.splice(index, 1);
+      addAudit(state, access.user!.id, "instance.member.removed", `${access.instance!.id}:${targetUserId}`);
+      return true;
+    });
+    if (!removed) return notFound(reply, "协作者不存在");
+    return reply.code(204).send();
   });
 
   app.delete("/api/instances/:id", async (request, reply) => {
