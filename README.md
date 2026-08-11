@@ -25,6 +25,10 @@ store. Production uses PostgreSQL through `docker compose up -d --build` after c
 The first panel account is created from `BOOTSTRAP_USERNAME` and `BOOTSTRAP_PASSWORD`. Change
 the bootstrap password before the first start; it is only honored when no users exist.
 
+For remote backups, set `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, and
+`S3_SECRET_ACCESS_KEY` together in the Agent `.env`. Any S3-compatible provider, including
+MinIO, is supported; credentials stay on the node and are never sent to the browser.
+
 ## Security baseline
 
 - Browser sessions use signed, HttpOnly cookies.
@@ -32,4 +36,3 @@ the bootstrap password before the first start; it is only honored when no users 
 - Node enrollment tokens are single-use and stored hashed.
 - Agents maintain outbound WebSocket connections and never publish the Docker socket.
 - Every destructive or control operation is written to the audit log.
-

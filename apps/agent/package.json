@@ -11,6 +11,7 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.750.0",
     "@micopanel/protocol": "workspace:*",
     "dockerode": "^4.0.7",
     "tar": "^7.4.3",
@@ -24,4 +25,3 @@
     "tsx": "^4.19.3"
   }
 }
-

@@ -35,7 +35,7 @@ class Agent {
   private retryDelay = 1000;
   private taskChain = Promise.resolve();
   private heartbeat?: NodeJS.Timeout;
-  private readonly runtime = new DockerRuntime(config.DOCKER_SOCKET, config.DATA_ROOT, (instanceId, line) => this.send({ type: "console.output", instanceId, line }));
+  private readonly runtime = new DockerRuntime(config.DOCKER_SOCKET, config.DATA_ROOT, (instanceId, line) => this.send({ type: "console.output", instanceId, line }), config.s3);
 
   async start(): Promise<void> {
     await this.runtime.init();
@@ -109,4 +109,3 @@ class Agent {
 }
 
 void new Agent().start();
-

@@ -17,7 +17,8 @@ const testConfig = {
 const json = (body: unknown) => ({ headers: { "content-type": "application/json" }, payload: JSON.stringify(body) });
 
 test("control plane bootstraps, queues workloads, and archives safely", async () => {
-  const app = await buildServer({ config: testConfig, store: new MemoryStore() });
+  const store = new MemoryStore();
+  const app = await buildServer({ config: testConfig, store });
   try {
     const before = await app.inject({ method: "GET", url: "/api/auth/status" });
     assert.equal(before.statusCode, 200);
@@ -57,6 +58,17 @@ test("control plane bootstraps, queues workloads, and archives safely", async ()
     assert.equal(instanceBody.task.status, "queued");
     assert.equal(instanceBody.task.type, "instance.create");
     assert.equal(instanceBody.instance.ports[0].host, 25565);
+
+    const backup = await app.inject({ method: "POST", url: `/api/instances/${instanceBody.instance.id}/backups`, headers: { cookie, "content-type": "application/json" }, payload: JSON.stringify({ destination: "local" }) });
+    assert.equal(backup.statusCode, 202);
+    const backupBody = backup.json() as { backup: { id: string } };
+    await store.transaction((state) => {
+      const record = state.backups.find((candidate) => candidate.id === backupBody.backup.id)!;
+      record.status = "available";
+    });
+    const restore = await app.inject({ method: "POST", url: `/api/instances/${instanceBody.instance.id}/backups/${backupBody.backup.id}/restore`, headers: { cookie } });
+    assert.equal(restore.statusCode, 202);
+    assert.equal(restore.json().task.type, "instance.restore");
 
     const archive = await app.inject({ method: "DELETE", url: `/api/instances/${instanceBody.instance.id}`, headers: { cookie } });
     assert.equal(archive.statusCode, 202);

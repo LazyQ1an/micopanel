@@ -1,11 +1,14 @@
 import { createHash } from "node:crypto";
-import { createWriteStream, existsSync } from "node:fs";
+import { createReadStream, createWriteStream, existsSync } from "node:fs";
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, relative, resolve } from "node:path";
-import { PassThrough } from "node:stream";
+import { PassThrough, type Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import { GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import Docker from "dockerode";
 import * as tar from "tar";
 import type { AgentTask, InstanceSpec, NodeUsage } from "@micopanel/protocol";
+import type { S3Config } from "./config.js";
 
 export interface TaskResult {
   message: string;
@@ -15,13 +18,25 @@ export interface TaskResult {
 export class DockerRuntime {
   private readonly docker: Docker;
   private readonly consoleStreams = new Map<string, NodeJS.WritableStream>();
+  private readonly s3?: S3Client;
+  private readonly s3Bucket?: string;
 
   constructor(
     socketPath: string,
     private readonly dataRoot: string,
-    private readonly publishConsole: (instanceId: string, line: string) => void
+    private readonly publishConsole: (instanceId: string, line: string) => void,
+    s3Config?: S3Config
   ) {
     this.docker = new Docker({ socketPath });
+    if (s3Config) {
+      this.s3 = new S3Client({
+        endpoint: s3Config.endpoint,
+        region: s3Config.region,
+        forcePathStyle: true,
+        credentials: { accessKeyId: s3Config.accessKeyId, secretAccessKey: s3Config.secretAccessKey }
+      });
+      this.s3Bucket = s3Config.bucket;
+    }
   }
 
   async init(): Promise<void> {
@@ -41,6 +56,10 @@ export class DockerRuntime {
 
   private archivePath(instanceId: string): string {
     return resolve(this.dataRoot, "archives", instanceId);
+  }
+
+  private backupPath(instanceId: string, backupId: string): string {
+    return resolve(this.dataRoot, "backups", `${instanceId}-${backupId}.tar.gz`);
   }
 
   private safeFilePath(instanceId: string, requestedPath: string): string {
@@ -133,6 +152,54 @@ export class DockerRuntime {
     await this.ensureConsole(instance.id);
   }
 
+  private async checkpoint(instance: InstanceSpec, release = false): Promise<void> {
+    const stream = this.consoleStreams.get(instance.id);
+    if (!stream) return;
+    if (instance.kind === "bedrock") stream.write(release ? "save resume\n" : "save hold\n");
+    else stream.write(release ? "save-on\n" : "save-all flush\nsave-off\n");
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 400));
+  }
+
+  private async uploadBackup(instanceId: string, backupId: string, archive: string): Promise<string> {
+    if (!this.s3 || !this.s3Bucket) throw new Error("S3 backup target is not configured on this node");
+    const key = `micopanel/${instanceId}/${backupId}.tar.gz`;
+    await this.s3.send(new PutObjectCommand({ Bucket: this.s3Bucket, Key: key, Body: createReadStream(archive), ContentType: "application/gzip" }));
+    return key;
+  }
+
+  private async downloadBackup(instanceId: string, backupId: string): Promise<string> {
+    if (!this.s3 || !this.s3Bucket) throw new Error("S3 backup target is not configured on this node");
+    const target = this.backupPath(instanceId, backupId);
+    const key = `micopanel/${instanceId}/${backupId}.tar.gz`;
+    const response = await this.s3.send(new GetObjectCommand({ Bucket: this.s3Bucket, Key: key }));
+    if (!response.Body) throw new Error("S3 backup object has no body");
+    await pipeline(response.Body as Readable, createWriteStream(target));
+    return target;
+  }
+
+  private async restoreBackup(instance: InstanceSpec, backup: { id: string; destination: "local" | "s3" }): Promise<TaskResult> {
+    let archive = this.backupPath(instance.id, backup.id);
+    if (backup.destination === "s3") archive = await this.downloadBackup(instance.id, backup.id);
+    if (!existsSync(archive)) throw new Error("备份文件不存在，无法恢复");
+    const container = await this.inspectOrUndefined(instance.id);
+    if (container) {
+      try { await container.stop({ t: 30 }); } catch { /* already stopped is safe */ }
+    }
+    const current = this.instancePath(instance.id);
+    const rollback = resolve(this.dataRoot, "archives", `${instance.id}-restore-${Date.now()}`);
+    if (existsSync(current)) await rename(current, rollback);
+    await mkdir(current, { recursive: true });
+    try {
+      await tar.x({ file: archive, cwd: current });
+      await this.recreate(instance);
+    } catch (error) {
+      await rm(current, { recursive: true, force: true });
+      if (existsSync(rollback)) await rename(rollback, current);
+      throw error;
+    }
+    return { message: "备份已恢复，旧数据已作为节点归档保留" };
+  }
+
   async execute(task: AgentTask): Promise<TaskResult> {
     const rawInstance = task.payload.instance;
     const instance = rawInstance as InstanceSpec | undefined;
@@ -199,14 +266,23 @@ export class DockerRuntime {
       case "instance.backup": {
         if (!instance) throw new Error("Backup task did not include an instance spec");
         const backupId = String(task.payload.backupId);
-        const backupFile = resolve(this.dataRoot, "backups", `${instance.id}-${backupId}.tar.gz`);
-        await tar.c({ gzip: true, file: backupFile, cwd: this.instancePath(instance.id) }, ["."]);
+        const backupFile = this.backupPath(instance.id, backupId);
+        await this.checkpoint(instance);
+        try {
+          await tar.c({ gzip: true, file: backupFile, cwd: this.instancePath(instance.id) }, ["."]);
+        } finally {
+          await this.checkpoint(instance, true);
+        }
         const fileBuffer = await readFile(backupFile);
         const checksum = createHash("sha256").update(fileBuffer).digest("hex");
-        return { message: "备份归档已创建", data: { sizeBytes: fileBuffer.byteLength, checksum, path: basename(backupFile) } };
+        const destination = task.payload.destination === "s3" ? "s3" : "local";
+        const remoteKey = destination === "s3" ? await this.uploadBackup(instance.id, backupId, backupFile) : undefined;
+        return { message: destination === "s3" ? "备份已上传到对象存储" : "备份归档已创建", data: { sizeBytes: fileBuffer.byteLength, checksum, path: remoteKey ?? basename(backupFile) } };
       }
       case "instance.restore": {
         if (!instance) throw new Error("Restore task did not include an instance spec");
+        const backup = task.payload.backup as { id?: string; destination?: "local" | "s3" } | undefined;
+        if (backup?.id && backup.destination) return this.restoreBackup(instance, { id: backup.id, destination: backup.destination });
         const archived = this.archivePath(instance.id);
         const current = this.instancePath(instance.id);
         if (!existsSync(archived)) throw new Error("归档目录不存在，无法恢复");

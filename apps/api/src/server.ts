@@ -228,6 +228,8 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
           instance.status = "offline";
         } else if (task.type === "instance.start" || task.type === "instance.restart") {
           instance.status = "running";
+        } else if (task.type === "instance.restore") {
+          instance.status = task.payload.backup ? "running" : "offline";
         } else if (task.type === "instance.archive") {
           instance.status = "archived";
         }
@@ -559,6 +561,24 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
     return reply.code(202).send({ backup, task: taskPublic(task) });
   });
 
+  app.post("/api/instances/:id/backups/:backupId/restore", async (request, reply) => {
+    const access = await getInstanceAccess(request, reply, "instance.backups");
+    if (!access.user || !access.instance) return access.response;
+    const backupId = (request.params as { backupId: string }).backupId;
+    const backup = (await store.read()).backups.find((candidate) => candidate.id === backupId && candidate.instanceId === access.instance!.id);
+    if (!backup) return notFound(reply, "备份不存在");
+    if (backup.status !== "available") return reply.code(409).send({ error: "备份尚不可用于恢复" });
+    const instance = await store.transaction((state) => {
+      const target = state.instances.find((candidate) => candidate.id === access.instance!.id)!;
+      target.status = "starting";
+      target.updatedAt = now();
+      addAudit(state, access.user!.id, "backup.restore.requested", backup.id, target.id);
+      return target;
+    });
+    const task = await enqueue(access.user.id, { type: "instance.restore", nodeId: instance.nodeId, instanceId: instance.id, payload: { instance, backup } });
+    return reply.code(202).send({ backup, task: taskPublic(task) });
+  });
+
   app.get("/api/instances/:id/schedules", async (request, reply) => {
     const access = await getInstanceAccess(request, reply, "instance.schedules");
     if (!access.user || !access.instance) return access.response;
@@ -632,7 +652,7 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
       addAudit(state, access.user!.id, "instance.restored", target.id);
       return target;
     });
-    const task = await enqueue(access.user.id, { type: "instance.restore", nodeId: instance.nodeId, instanceId: instance.id, payload: { instance } });
+    const task = await enqueue(access.user.id, { type: "instance.restore", nodeId: instance.nodeId, instanceId: instance.id, payload: { instance, archiveRestore: true } });
     return reply.code(202).send({ instance: instancePublic(instance), task: taskPublic(task) });
   });
 
