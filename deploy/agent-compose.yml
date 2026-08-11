@@ -1,0 +1,17 @@
+services:
+  agent:
+    image: ghcr.io/lazyq1an/micopanel-agent:latest
+    restart: unless-stopped
+    environment:
+      CONTROLLER_URL: ${CONTROLLER_URL:?Set the public panel URL, e.g. https://panel.example.com}
+      ENROLLMENT_TOKEN: ${ENROLLMENT_TOKEN:?Create a node in MicoPanel first}
+      NODE_NAME: ${NODE_NAME:-minecraft-node}
+      DOCKER_SOCKET: /var/run/docker.sock
+      DATA_ROOT: /var/lib/micopanel
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - micopanel-node-data:/var/lib/micopanel
+
+volumes:
+  micopanel-node-data:
+

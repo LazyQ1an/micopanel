@@ -1,0 +1,18 @@
+{
+  "name": "micopanel",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@11.13.0",
+  "scripts": {
+    "dev": "pnpm --filter @micopanel/protocol build && concurrently -n api,web -c blue,green \"pnpm --filter @micopanel/api dev\" \"pnpm --filter @micopanel/web dev\"",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm --filter @micopanel/protocol build && pnpm --filter @micopanel/api --filter @micopanel/agent --filter @micopanel/web -r typecheck",
+    "test": "pnpm --filter @micopanel/protocol build && pnpm --filter @micopanel/api test",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "prettier": "^3.5.3",
+    "typescript": "^5.8.2"
+  }
+}
