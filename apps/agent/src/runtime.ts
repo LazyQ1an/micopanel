@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { createReadStream, createWriteStream, existsSync } from "node:fs";
-import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, rm, stat, statfs, writeFile } from "node:fs/promises";
+import { cpus, freemem, loadavg, totalmem } from "node:os";
 import { basename, dirname, relative, resolve } from "node:path";
 import { PassThrough, type Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -342,16 +343,30 @@ export class DockerRuntime {
   }
 
   async usage(): Promise<NodeUsage> {
-    const info = await this.docker.info();
-    const disk = await stat(this.dataRoot);
+    const filesystem = await statfs(this.dataRoot);
+    let networkRxBytes = 0;
+    let networkTxBytes = 0;
+    try {
+      const rows = (await readFile("/proc/net/dev", "utf8")).split("\n").slice(2);
+      for (const row of rows) {
+        const values = row.replace(":", " ").trim().split(/\s+/).map(Number);
+        if (values.length >= 10 && values.every((value) => Number.isFinite(value))) {
+          networkRxBytes += values[1];
+          networkTxBytes += values[9];
+        }
+      }
+    } catch {
+      // /proc is Linux-specific. Metrics other than network remain available on supported nodes.
+    }
+    const diskLimitBytes = filesystem.blocks * filesystem.bsize;
     return {
-      cpuPercent: 0,
-      memoryBytes: 0,
-      memoryLimitBytes: 0,
-      diskBytes: disk.size,
-      diskLimitBytes: 0,
-      networkRxBytes: 0,
-      networkTxBytes: 0
+      cpuPercent: Math.min(100, (loadavg()[0] / Math.max(1, cpus().length)) * 100),
+      memoryBytes: totalmem() - freemem(),
+      memoryLimitBytes: totalmem(),
+      diskBytes: Math.max(0, (filesystem.blocks - filesystem.bfree) * filesystem.bsize),
+      diskLimitBytes,
+      networkRxBytes,
+      networkTxBytes
     };
   }
 }

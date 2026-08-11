@@ -49,9 +49,9 @@ class Agent {
     socket.on("open", () => {
       this.retryDelay = 1000;
       if (this.credentials) {
-        this.send({ type: "authenticate", ...this.credentials, agentVersion: config.AGENT_VERSION, capabilities: ["docker", "console", "files", "backups"] });
+        this.send({ type: "authenticate", ...this.credentials, agentVersion: config.AGENT_VERSION, capabilities: ["docker", "console", "files", "backups", "metrics"] });
       } else if (config.ENROLLMENT_TOKEN) {
-        this.send({ type: "register", token: config.ENROLLMENT_TOKEN, nodeName: config.NODE_NAME, agentVersion: config.AGENT_VERSION, capabilities: ["docker", "console", "files", "backups"] });
+        this.send({ type: "register", token: config.ENROLLMENT_TOKEN, nodeName: config.NODE_NAME, agentVersion: config.AGENT_VERSION, capabilities: ["docker", "console", "files", "backups", "metrics"] });
       } else {
         socket.close(4403, "missing credentials and enrollment token");
       }
