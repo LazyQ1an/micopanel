@@ -114,6 +114,26 @@ export interface ArtifactRecord {
   tokenExpiresAt?: string;
 }
 
+export interface FileTransferRecord {
+  id: string;
+  instanceId: string;
+  nodeId: string;
+  direction: "upload" | "download";
+  path: string;
+  fileName: string;
+  storageName: string;
+  mimeType: string;
+  sizeBytes?: number;
+  checksum?: string;
+  status: "queued" | "receiving" | "available" | "failed" | "expired";
+  tokenHash: string;
+  expiresAt: string;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+  error?: string;
+}
+
 export interface PanelState {
   users: User[];
   sessions: Session[];
@@ -125,6 +145,7 @@ export interface PanelState {
   schedules: ScheduleRecord[];
   audits: AuditRecord[];
   artifacts: ArtifactRecord[];
+  fileTransfers: FileTransferRecord[];
 }
 
 export const createEmptyState = (): PanelState => ({
@@ -137,5 +158,6 @@ export const createEmptyState = (): PanelState => ({
   backups: [],
   schedules: [],
   audits: [],
-  artifacts: []
+  artifacts: [],
+  fileTransfers: []
 });

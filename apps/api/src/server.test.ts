@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { rm } from "node:fs/promises";
 import test from "node:test";
 import { buildServer } from "./server.js";
 import { MemoryStore } from "./store.js";
@@ -14,7 +15,10 @@ const testConfig = {
   CORS_ORIGIN: "http://localhost:5173",
   ARTIFACTS_DIR: "./data/test-artifacts",
   ARTIFACT_MAX_BYTES: 1024 * 1024,
-  ARTIFACT_TOKEN_TTL_MINUTES: 30
+  ARTIFACT_TOKEN_TTL_MINUTES: 30,
+  FILE_TRANSFERS_DIR: "./data/test-file-transfers",
+  FILE_TRANSFER_MAX_BYTES: 1024 * 1024,
+  FILE_TRANSFER_TOKEN_TTL_MINUTES: 30
 };
 
 const json = (body: unknown) => ({ headers: { "content-type": "application/json" }, payload: JSON.stringify(body) });
@@ -66,6 +70,48 @@ test("control plane bootstraps, queues workloads, and archives safely", async ()
     assert.equal(syncFiles.statusCode, 202);
     assert.equal(syncFiles.json().task.type, "file.list");
 
+    const boundary = "micopanel-test-boundary";
+    const upload = await app.inject({
+      method: "POST",
+      url: `/api/instances/${instanceBody.instance.id}/files/upload?path=%2Fops.txt`,
+      headers: { cookie, "content-type": `multipart/form-data; boundary=${boundary}` },
+      payload: `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="ops.txt"\r\nContent-Type: text/plain\r\n\r\nhello from panel\r\n--${boundary}--\r\n`
+    });
+    assert.equal(upload.statusCode, 202);
+    const uploadBody = upload.json() as { transfer: { id: string; checksum: string }; task: { id: string; type: string } };
+    assert.equal(uploadBody.task.type, "file.upload");
+    const uploadTask = (await store.read()).tasks.find((task) => task.id === uploadBody.task.id)!;
+    const uploadToken = (uploadTask.payload.transfer as { token: string }).token;
+    const agentFetch = await app.inject({ method: "GET", url: `/api/agent/file-transfers/${uploadBody.transfer.id}?token=${uploadToken}` });
+    assert.equal(agentFetch.statusCode, 200);
+    assert.equal(agentFetch.body, "hello from panel");
+    const rejectedAgentFetch = await app.inject({ method: "GET", url: `/api/agent/file-transfers/${uploadBody.transfer.id}?token=${"x".repeat(32)}` });
+    assert.equal(rejectedAgentFetch.statusCode, 403);
+
+    const download = await app.inject({
+      method: "POST",
+      url: `/api/instances/${instanceBody.instance.id}/files/download`,
+      headers: { cookie, "content-type": "application/json" },
+      payload: JSON.stringify({ path: "/latest.log" })
+    });
+    assert.equal(download.statusCode, 202);
+    const downloadBody = download.json() as { transfer: { id: string; status: string }; task: { id: string; type: string } };
+    assert.equal(downloadBody.task.type, "file.download");
+    const downloadTask = (await store.read()).tasks.find((task) => task.id === downloadBody.task.id)!;
+    const downloadToken = (downloadTask.payload.transfer as { token: string }).token;
+    const agentUpload = await app.inject({
+      method: "POST",
+      url: `/api/agent/file-transfers/${downloadBody.transfer.id}?token=${downloadToken}`,
+      headers: { "content-type": "application/octet-stream", "content-length": "16" },
+      payload: "node log content"
+    });
+    assert.equal(agentUpload.statusCode, 201);
+    const transferStatus = await app.inject({ method: "GET", url: `/api/instances/${instanceBody.instance.id}/file-transfers/${downloadBody.transfer.id}`, headers: { cookie } });
+    assert.equal(transferStatus.json().transfer.status, "available");
+    const browserDownload = await app.inject({ method: "GET", url: `/api/instances/${instanceBody.instance.id}/file-transfers/${downloadBody.transfer.id}/download`, headers: { cookie } });
+    assert.equal(browserDownload.statusCode, 200);
+    assert.equal(browserDownload.body, "node log content");
+
     const missingArtifact = await app.inject({
       method: "POST",
       url: "/api/instances",
@@ -107,5 +153,7 @@ test("control plane bootstraps, queues workloads, and archives safely", async ()
     assert.equal(dashboard.json().instances[0].status, "archived");
   } finally {
     await app.close();
+    await rm(testConfig.ARTIFACTS_DIR, { recursive: true, force: true });
+    await rm(testConfig.FILE_TRANSFERS_DIR, { recursive: true, force: true });
   }
 });

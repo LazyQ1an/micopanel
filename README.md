@@ -43,6 +43,22 @@ entries are path-checked before extraction and are limited to 2 GB uncompressed.
 `ARTIFACT_MAX_BYTES` and `ARTIFACT_TOKEN_TTL_MINUTES` in the control-plane `.env` to adjust the
 upload limit and the time available for a queued Agent to download a package.
 
+## Instance files
+
+The instance file workspace supports directory browsing, text editing, uploads, and downloads
+without exposing a node filesystem or Docker socket to the browser. Text files are read through
+the Agent and capped at 1 MB for editing. Uploads are staged in the control-plane
+`api-file-transfers` volume, then the target Agent fetches and SHA-256-verifies the stream before
+an atomic write into the instance data directory. Downloads follow the reverse path: the Agent
+streams a regular file to the control plane and the browser receives it only after the transfer is
+complete.
+
+Set `FILE_TRANSFER_MAX_BYTES` and `FILE_TRANSFER_TOKEN_TTL_MINUTES` in the control-plane `.env`
+to control the maximum upload/download size and the retention period for a pending or ready
+transfer. Each transfer has a task-scoped token; expired, failed, and completed-upload staging
+files are removed automatically. Instance collaborators still require the `instance.files`
+permission for every file route.
+
 ## Security baseline
 
 - Browser sessions use signed, HttpOnly cookies.

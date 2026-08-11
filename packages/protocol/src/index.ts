@@ -13,7 +13,9 @@ export const TASK_TYPES = [
   "instance.archive",
   "file.list",
   "file.read",
-  "file.write"
+  "file.write",
+  "file.upload",
+  "file.download"
 ] as const;
 export type TaskType = (typeof TASK_TYPES)[number];
 export type TaskStatus = "queued" | "delivered" | "running" | "succeeded" | "failed" | "cancelled";

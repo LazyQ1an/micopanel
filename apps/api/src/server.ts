@@ -42,7 +42,7 @@ import {
 } from "./service.js";
 import { createStore, type StateStore } from "./store.js";
 import { SERVER_TEMPLATES } from "./templates.js";
-import type { ArtifactRecord, BackupRecord, InstanceRecord, ManagedFile, NodeRecord, ScheduleRecord, TaskRecord, User } from "./types.js";
+import type { ArtifactRecord, BackupRecord, FileTransferRecord, InstanceRecord, ManagedFile, NodeRecord, ScheduleRecord, TaskRecord, User } from "./types.js";
 
 type SocketLike = {
   readyState: number;
@@ -57,6 +57,7 @@ const sessionCookie = "mico_session";
 const sessionLifetimeMs = 1000 * 60 * 60 * 24 * 14;
 const archiveRetentionMs = 1000 * 60 * 60 * 24 * 7;
 const now = (): string => new Date().toISOString();
+const transferPublic = ({ tokenHash: _tokenHash, ...transfer }: FileTransferRecord) => transfer;
 
 class RealtimeHub {
   readonly agents = new Map<string, SocketLike>();
@@ -115,21 +116,27 @@ const scheduleSchema = z.object({
 });
 const memberSchema = z.object({ permissions: z.array(z.enum(ALL_INSTANCE_PERMISSIONS)).min(1) });
 const userSchema = z.object({ username: z.string().min(3).max(32), password: z.string().min(10).max(128), role: z.enum(["admin", "user"]).default("user") });
-const filePathSchema = z.object({ path: z.string().min(1).max(512).refine((path) => !path.includes("..") && path.startsWith("/"), "文件路径无效") });
+const safeFilePath = (path: string): boolean => {
+  if (!path.startsWith("/") || path === "/" || path.includes("\\") || path.includes("\0")) return false;
+  return path.split("/").every((segment, index) => index === 0 || (segment.length > 0 && segment !== "." && segment !== ".."));
+};
+const filePathSchema = z.object({ path: z.string().min(2).max(512).refine(safeFilePath, "文件路径无效") });
 const fileSchema = filePathSchema.extend({ content: z.string().max(10_000_000) });
 
 export async function buildServer(options?: { config?: AppConfig; store?: StateStore }) {
   const config = options?.config ?? loadConfig();
   const store = options?.store ?? createStore(config.DATABASE_URL);
   await store.init();
-  await mkdir(config.ARTIFACTS_DIR, { recursive: true });
+  await Promise.all([mkdir(config.ARTIFACTS_DIR, { recursive: true }), mkdir(config.FILE_TRANSFERS_DIR, { recursive: true })]);
 
-  const app = Fastify({ logger: config.NODE_ENV !== "test", bodyLimit: 10_500_000, trustProxy: config.NODE_ENV === "production" });
+  const maxIncomingFileSize = Math.max(config.ARTIFACT_MAX_BYTES, config.FILE_TRANSFER_MAX_BYTES);
+  const app = Fastify({ logger: config.NODE_ENV !== "test", bodyLimit: Math.max(10_500_000, maxIncomingFileSize + 1024), trustProxy: config.NODE_ENV === "production" });
   const hub = new RealtimeHub();
   await app.register(cookie, { secret: config.SESSION_SECRET, hook: "onRequest" });
   await app.register(cors, { origin: config.CORS_ORIGIN, credentials: true });
   await app.register(rateLimit, { global: true, max: 180, timeWindow: "1 minute", skipOnError: true });
-  await app.register(multipart, { limits: { files: 1, fileSize: config.ARTIFACT_MAX_BYTES } });
+  await app.register(multipart, { limits: { files: 1, fileSize: maxIncomingFileSize } });
+  app.addContentTypeParser("application/octet-stream", (_request, payload, done) => done(null, payload));
   await app.register(websocket, { options: { maxPayload: 10_500_000 } });
 
   app.addHook("onSend", async (_request, reply, payload) => {
@@ -222,6 +229,7 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
   const agentTaskResult = async (message: Extract<AgentInboundMessage, { type: "task.result" }>): Promise<void> => {
     let status: "succeeded" | "failed" = message.ok ? "succeeded" : "failed";
     let instanceId: string | undefined;
+    let transferStorageToRemove: string | undefined;
     await store.transaction((state) => {
       const task = state.tasks.find((candidate) => candidate.id === message.taskId);
       if (!task) return;
@@ -264,8 +272,24 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
       if (task.type === "file.read" && instance && typeof task.payload.path === "string" && typeof message.data?.content === "string") {
         instance.files[task.payload.path] = message.data.content;
       }
+      if ((task.type === "file.upload" || task.type === "file.download") && typeof (task.payload.transfer as { id?: unknown } | undefined)?.id === "string") {
+        const transfer = state.fileTransfers.find((candidate) => candidate.id === (task.payload.transfer as { id: string }).id);
+        if (transfer) {
+          if (task.type === "file.upload") {
+            transfer.status = message.ok ? "available" : "failed";
+            transfer.error = message.ok ? undefined : message.message ?? "节点文件写入失败";
+            transfer.updatedAt = now();
+            transferStorageToRemove = transfer.storageName;
+          } else if (!message.ok && transfer.status !== "available") {
+            transfer.status = "failed";
+            transfer.error = message.message ?? "节点文件回传失败";
+            transfer.updatedAt = now();
+          }
+        }
+      }
       addAudit(state, "agent", message.ok ? "task.succeeded" : "task.failed", task.id, message.message);
     });
+    if (transferStorageToRemove) await rm(getTransferFilePath(transferStorageToRemove), { force: true });
     hub.broadcast({ type: "task.updated", taskId: message.taskId, status, message: message.message, progress: 100 });
     if (instanceId) {
       const state = await store.read();
@@ -396,6 +420,82 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
     try { await stat(filePath); } catch { return notFound(reply, "制品文件不存在"); }
     reply.type(artifact.mimeType).header("Content-Disposition", `attachment; filename="${encodeURIComponent(artifact.fileName)}"`);
     return reply.send(createReadStream(filePath));
+  });
+
+  const getTransferFilePath = (storageName: string): string => {
+    const root = resolve(config.FILE_TRANSFERS_DIR);
+    const filePath = resolve(root, storageName);
+    if (relative(root, filePath).startsWith("..")) throw new Error("文件传输路径无效");
+    return filePath;
+  };
+
+  app.get("/api/agent/file-transfers/:id", async (request, reply) => {
+    const params = request.params as { id: string };
+    const query = z.object({ token: z.string().min(32) }).parse(request.query);
+    const transfer = (await store.read()).fileTransfers.find((candidate) => candidate.id === params.id);
+    if (!transfer || transfer.direction !== "upload" || transfer.status !== "queued" || new Date(transfer.expiresAt).getTime() < Date.now() || !verifyToken(query.token, transfer.tokenHash)) {
+      return reply.code(403).send({ error: "文件上传授权无效或已过期" });
+    }
+    const filePath = getTransferFilePath(transfer.storageName);
+    try { await stat(filePath); } catch { return notFound(reply, "待上传文件不存在"); }
+    reply
+      .type(transfer.mimeType)
+      .header("Content-Length", String(transfer.sizeBytes ?? 0))
+      .header("X-MicoPanel-Checksum", transfer.checksum ?? "")
+      .header("X-MicoPanel-Path", encodeURIComponent(transfer.path));
+    return reply.send(createReadStream(filePath));
+  });
+
+  app.post("/api/agent/file-transfers/:id", { config: { bodyLimit: config.FILE_TRANSFER_MAX_BYTES + 1024 } }, async (request, reply) => {
+    const params = request.params as { id: string };
+    const query = z.object({ token: z.string().min(32) }).parse(request.query);
+    const transfer = (await store.read()).fileTransfers.find((candidate) => candidate.id === params.id);
+    if (!transfer || transfer.direction !== "download" || transfer.status !== "queued" || new Date(transfer.expiresAt).getTime() < Date.now() || !verifyToken(query.token, transfer.tokenHash)) {
+      return reply.code(403).send({ error: "文件下载授权无效或已过期" });
+    }
+    const contentLength = Number(request.headers["content-length"] ?? 0);
+    if (!Number.isSafeInteger(contentLength) || contentLength < 0 || contentLength > config.FILE_TRANSFER_MAX_BYTES) {
+      return reply.code(413).send({ error: "文件大小超过传输限制" });
+    }
+    const destination = getTransferFilePath(transfer.storageName);
+    await store.transaction((state) => {
+      const target = state.fileTransfers.find((candidate) => candidate.id === transfer.id);
+      if (!target || target.status !== "queued") return;
+      target.status = "receiving";
+      target.updatedAt = now();
+    });
+    const digest = createHash("sha256");
+    let bytes = 0;
+    const hashStream = new Transform({ transform(chunk, _encoding, callback) {
+      bytes += chunk.length;
+      if (bytes > config.FILE_TRANSFER_MAX_BYTES) return callback(new Error("文件大小超过传输限制"));
+      digest.update(chunk);
+      callback(null, chunk);
+    } });
+    try {
+      await pipeline(request.body as NodeJS.ReadableStream, hashStream, createWriteStream(destination, { flags: "wx" }));
+      const checksum = digest.digest("hex");
+      await store.transaction((state) => {
+        const target = state.fileTransfers.find((candidate) => candidate.id === transfer.id);
+        if (!target) return;
+        target.status = "available";
+        target.sizeBytes = bytes;
+        target.checksum = checksum;
+        target.updatedAt = now();
+        addAudit(state, "agent", "file.download.received", `${target.instanceId}:${target.path}`, `${bytes} bytes`);
+      });
+      return reply.code(201).send({ ok: true, checksum, sizeBytes: bytes });
+    } catch (error) {
+      await rm(destination, { force: true });
+      await store.transaction((state) => {
+        const target = state.fileTransfers.find((candidate) => candidate.id === transfer.id);
+        if (!target) return;
+        target.status = "failed";
+        target.error = error instanceof Error ? error.message : "节点文件回传失败";
+        target.updatedAt = now();
+      });
+      throw error;
+    }
   });
 
   app.get("/api/auth/status", async (request) => {
@@ -621,8 +721,32 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
     const access = await getInstanceAccess(request, reply, "instance.files");
     if (!access.user || !access.instance) return access.response;
     const path = typeof (request.query as { path?: string }).path === "string" ? (request.query as { path: string }).path : "/";
-    const files = access.instance.fileIndex.filter((file) => file.path.startsWith(path)).map((file) => ({ ...file, content: access.instance!.files[file.path] }));
+    if (path !== "/" && !safeFilePath(`${path}/placeholder`)) return reply.code(422).send({ error: "目录路径无效" });
+    const prefix = path === "/" ? "/" : `${path}/`;
+    const files = access.instance.fileIndex.filter((file) => file.path === path || file.path.startsWith(prefix)).map((file) => ({ ...file, content: access.instance!.files[file.path] }));
     return { files };
+  });
+
+  app.get("/api/instances/:id/file-transfers/:transferId", async (request, reply) => {
+    const access = await getInstanceAccess(request, reply, "instance.files");
+    if (!access.user || !access.instance) return access.response;
+    const transferId = (request.params as { transferId: string }).transferId;
+    const transfer = (await store.read()).fileTransfers.find((candidate) => candidate.id === transferId && candidate.instanceId === access.instance!.id);
+    if (!transfer) return notFound(reply, "文件传输不存在");
+    return { transfer: transferPublic(transfer) };
+  });
+
+  app.get("/api/instances/:id/file-transfers/:transferId/download", async (request, reply) => {
+    const access = await getInstanceAccess(request, reply, "instance.files");
+    if (!access.user || !access.instance) return access.response;
+    const transferId = (request.params as { transferId: string }).transferId;
+    const transfer = (await store.read()).fileTransfers.find((candidate) => candidate.id === transferId && candidate.instanceId === access.instance!.id);
+    if (!transfer || transfer.direction !== "download" || transfer.status !== "available") return notFound(reply, "下载文件尚未就绪");
+    if (new Date(transfer.expiresAt).getTime() < Date.now()) return reply.code(410).send({ error: "下载文件已过期" });
+    const filePath = getTransferFilePath(transfer.storageName);
+    try { await stat(filePath); } catch { return notFound(reply, "下载文件不存在"); }
+    reply.type(transfer.mimeType).header("Content-Disposition", `attachment; filename="${encodeURIComponent(transfer.fileName)}"`);
+    return reply.send(createReadStream(filePath));
   });
 
   app.post("/api/instances/:id/files/sync", async (request, reply) => {
@@ -636,8 +760,104 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
     const access = await getInstanceAccess(request, reply, "instance.files");
     if (!access.user || !access.instance) return access.response;
     const input = filePathSchema.parse(request.body);
+    await store.transaction((state) => {
+      const target = state.instances.find((candidate) => candidate.id === access.instance!.id);
+      if (target) delete target.files[input.path];
+    });
     const task = await enqueue(access.user.id, { type: "file.read", nodeId: access.instance.nodeId, instanceId: access.instance.id, payload: input });
     return reply.code(202).send({ task: taskPublic(task) });
+  });
+
+  app.post("/api/instances/:id/files/upload", async (request, reply) => {
+    const access = await getInstanceAccess(request, reply, "instance.files");
+    if (!access.user || !access.instance) return access.response;
+    const input = filePathSchema.parse(request.query);
+    const part = await request.file();
+    if (!part) return reply.code(422).send({ error: "请选择要上传的文件" });
+    const fileName = basename(part.filename || "");
+    if (!fileName || fileName === "." || fileName.length > 255) {
+      part.file.resume();
+      return reply.code(422).send({ error: "文件名无效" });
+    }
+    const transferId = id();
+    const storageName = `${transferId}.upload`;
+    const destination = getTransferFilePath(storageName);
+    const digest = createHash("sha256");
+    const hashStream = new Transform({ transform(chunk, _encoding, callback) { digest.update(chunk); callback(null, chunk); } });
+    try {
+      await pipeline(part.file, hashStream, createWriteStream(destination, { flags: "wx" }));
+      if (part.file.truncated) throw new Error("上传文件超过大小限制");
+      const metadata = await stat(destination);
+      if (metadata.size > config.FILE_TRANSFER_MAX_BYTES) throw new Error("上传文件超过大小限制");
+      const token = randomToken(32);
+      const transfer: FileTransferRecord = {
+        id: transferId,
+        instanceId: access.instance.id,
+        nodeId: access.instance.nodeId,
+        direction: "upload",
+        path: input.path,
+        fileName,
+        storageName,
+        mimeType: part.mimetype || "application/octet-stream",
+        sizeBytes: metadata.size,
+        checksum: digest.digest("hex"),
+        status: "queued",
+        tokenHash: hashToken(token),
+        expiresAt: new Date(Date.now() + config.FILE_TRANSFER_TOKEN_TTL_MINUTES * 60_000).toISOString(),
+        createdBy: access.user.id,
+        createdAt: now(),
+        updatedAt: now()
+      };
+      await store.transaction((state) => {
+        state.fileTransfers.unshift(transfer);
+        addAudit(state, access.user!.id, "file.upload.queued", `${access.instance!.id}:${input.path}`, `${metadata.size} bytes`);
+      });
+      const task = await enqueue(access.user.id, {
+        type: "file.upload",
+        nodeId: access.instance.nodeId,
+        instanceId: access.instance.id,
+        payload: { path: input.path, transfer: { id: transfer.id, fileName: transfer.fileName, token, sizeBytes: transfer.sizeBytes, checksum: transfer.checksum } }
+      });
+      return reply.code(202).send({ transfer: transferPublic(transfer), task: taskPublic(task) });
+    } catch (error) {
+      await rm(destination, { force: true });
+      throw error;
+    }
+  });
+
+  app.post("/api/instances/:id/files/download", async (request, reply) => {
+    const access = await getInstanceAccess(request, reply, "instance.files");
+    if (!access.user || !access.instance) return access.response;
+    const input = filePathSchema.parse(request.body);
+    const transferId = id();
+    const token = randomToken(32);
+    const transfer: FileTransferRecord = {
+      id: transferId,
+      instanceId: access.instance.id,
+      nodeId: access.instance.nodeId,
+      direction: "download",
+      path: input.path,
+      fileName: basename(input.path),
+      storageName: `${transferId}.download`,
+      mimeType: "application/octet-stream",
+      status: "queued",
+      tokenHash: hashToken(token),
+      expiresAt: new Date(Date.now() + config.FILE_TRANSFER_TOKEN_TTL_MINUTES * 60_000).toISOString(),
+      createdBy: access.user.id,
+      createdAt: now(),
+      updatedAt: now()
+    };
+    await store.transaction((state) => {
+      state.fileTransfers.unshift(transfer);
+      addAudit(state, access.user!.id, "file.download.queued", `${access.instance!.id}:${input.path}`);
+    });
+    const task = await enqueue(access.user.id, {
+      type: "file.download",
+      nodeId: access.instance.nodeId,
+      instanceId: access.instance.id,
+      payload: { path: input.path, transfer: { id: transfer.id, fileName: transfer.fileName, token } }
+    });
+    return reply.code(202).send({ transfer: transferPublic(transfer), task: taskPublic(task) });
   });
 
   app.put("/api/instances/:id/files", async (request, reply) => {
@@ -824,7 +1044,15 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
         }
         const expired = state.instances.filter((instance) => instance.status === "archived" && instance.archiveExpiresAt && new Date(instance.archiveExpiresAt).getTime() <= currentTime);
         for (const instance of expired) addAudit(state, "system", "instance.archive.expired", instance.id);
-        return { dueSchedules, expired };
+        const expiredTransferStorage: string[] = [];
+        for (const transfer of state.fileTransfers) {
+          if (transfer.status === "expired" || new Date(transfer.expiresAt).getTime() > currentTime) continue;
+          transfer.status = "expired";
+          transfer.updatedAt = now();
+          expiredTransferStorage.push(transfer.storageName);
+          addAudit(state, "system", "file.transfer.expired", `${transfer.instanceId}:${transfer.path}`);
+        }
+        return { dueSchedules, expired, expiredTransferStorage };
       });
       for (const { schedule, instance } of due.dueSchedules) {
         const type: TaskType = schedule.action === "backup" ? "instance.backup" : schedule.action === "restart" ? "instance.restart" : "instance.command";
@@ -832,6 +1060,7 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
         await enqueue("system", { type, nodeId: instance.nodeId, instanceId: instance.id, payload: schedule.action === "backup" ? { backupId: backup!.id, destination: "local", instance } : schedule.action === "restart" ? { instance } : schedule.payload });
       }
       for (const instance of due.expired) await enqueue("system", { type: "instance.archive", nodeId: instance.nodeId, instanceId: instance.id, payload: { instance, purge: true } });
+      await Promise.all(due.expiredTransferStorage.map((storageName) => rm(getTransferFilePath(storageName), { force: true })));
     })();
   }, 10_000);
   scheduler.unref();
@@ -843,6 +1072,8 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
   app.setErrorHandler((error, _request, reply) => {
     if (error instanceof z.ZodError) return reply.code(422).send({ error: "请求参数无效", details: error.flatten() });
     const message = error instanceof Error ? error.message : "未知错误";
+    const statusCode = (error as { statusCode?: unknown }).statusCode;
+    if (typeof statusCode === "number" && statusCode >= 400 && statusCode < 500) return reply.code(statusCode).send({ error: message });
     if (message === "节点不存在" || message === "协作者不存在") return reply.code(404).send({ error: message });
     if (message.includes("端口") || message.includes("同名") || message.includes("已存在")) return reply.code(409).send({ error: message });
     app.log.error(error);

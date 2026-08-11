@@ -19,3 +19,17 @@ test("node resource snapshots report usable host metrics", async () => {
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("agent rejects paths that escape an instance directory", async () => {
+  const root = await mkdtemp(join(tmpdir(), "micopanel-agent-"));
+  const runtime = new DockerRuntime("/var/run/docker.sock", root, () => undefined);
+  const safeFilePath = (runtime as unknown as { safeFilePath(instanceId: string, path: string): Promise<string> }).safeFilePath.bind(runtime);
+  try {
+    const safePath = await safeFilePath("instance-01", "/server.properties");
+    assert.equal(safePath.endsWith("server.properties"), true);
+    await assert.rejects(() => safeFilePath("instance-01", "/../agent-credentials.json"), /Unsafe file path/);
+    await assert.rejects(() => safeFilePath("instance-01", "/plugins\\escape.jar"), /Unsafe file path/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

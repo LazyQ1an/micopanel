@@ -100,7 +100,7 @@ class Agent {
     this.send({ type: "task.ack", taskId: task.id });
     try {
       this.send({ type: "task.progress", taskId: task.id, message: "正在执行", progress: 10 });
-      const result = await this.runtime.execute(task);
+      const result = await this.runtime.execute(task, (message, progress) => this.send({ type: "task.progress", taskId: task.id, message, progress }));
       this.send({ type: "task.result", taskId: task.id, ok: true, message: result.message, data: result.data });
     } catch (error) {
       this.send({ type: "task.result", taskId: task.id, ok: false, message: error instanceof Error ? error.message : "Unknown agent error" });

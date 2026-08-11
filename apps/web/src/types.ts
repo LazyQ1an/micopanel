@@ -70,6 +70,22 @@ export interface Schedule {
   nextRunAt?: string;
 }
 
+export interface FileTransfer {
+  id: string;
+  instanceId: string;
+  direction: "upload" | "download";
+  path: string;
+  fileName: string;
+  mimeType: string;
+  sizeBytes?: number;
+  checksum?: string;
+  status: "queued" | "receiving" | "available" | "failed" | "expired";
+  expiresAt: string;
+  createdAt: string;
+  updatedAt: string;
+  error?: string;
+}
+
 export interface Dashboard {
   instances: Instance[];
   nodes: Node[];

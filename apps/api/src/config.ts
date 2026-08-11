@@ -12,7 +12,10 @@ const schema = z.object({
   CORS_ORIGIN: z.string().default("http://localhost:5173"),
   ARTIFACTS_DIR: z.string().default("./data/artifacts"),
   ARTIFACT_MAX_BYTES: z.coerce.number().int().positive().max(2 * 1024 * 1024 * 1024).default(1024 * 1024 * 1024),
-  ARTIFACT_TOKEN_TTL_MINUTES: z.coerce.number().int().positive().max(1440).default(60)
+  ARTIFACT_TOKEN_TTL_MINUTES: z.coerce.number().int().positive().max(1440).default(60),
+  FILE_TRANSFERS_DIR: z.string().default("./data/file-transfers"),
+  FILE_TRANSFER_MAX_BYTES: z.coerce.number().int().positive().max(2 * 1024 * 1024 * 1024).default(1024 * 1024 * 1024),
+  FILE_TRANSFER_TOKEN_TTL_MINUTES: z.coerce.number().int().positive().max(1440).default(60)
 });
 
 export type AppConfig = z.infer<typeof schema>;

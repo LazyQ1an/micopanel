@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
 import { createReadStream, createWriteStream, existsSync } from "node:fs";
-import { mkdir, readdir, readFile, rename, rm, stat, statfs, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readdir, readFile, rename, rm, stat, statfs, writeFile } from "node:fs/promises";
 import { cpus, freemem, loadavg, totalmem } from "node:os";
 import { basename, dirname, extname, relative, resolve } from "node:path";
-import { PassThrough, Readable } from "node:stream";
+import { PassThrough, Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import AdmZip from "adm-zip";
@@ -16,6 +16,8 @@ export interface TaskResult {
   message: string;
   data?: Record<string, unknown>;
 }
+
+type ProgressReporter = (message: string, progress: number) => void;
 
 export class DockerRuntime {
   private readonly docker: Docker;
@@ -46,6 +48,7 @@ export class DockerRuntime {
     await mkdir(resolve(this.dataRoot, "instances"), { recursive: true });
     await mkdir(resolve(this.dataRoot, "archives"), { recursive: true });
     await mkdir(resolve(this.dataRoot, "backups"), { recursive: true });
+    await mkdir(resolve(this.dataRoot, "transfers"), { recursive: true });
     await this.docker.ping();
   }
 
@@ -65,12 +68,32 @@ export class DockerRuntime {
     return resolve(this.dataRoot, "backups", `${instanceId}-${backupId}.tar.gz`);
   }
 
-  private safeFilePath(instanceId: string, requestedPath: string): string {
+  private async safeFilePath(instanceId: string, requestedPath: string): Promise<string> {
+    if (!requestedPath.startsWith("/") || requestedPath === "/" || requestedPath.includes("\\") || requestedPath.includes("\0")) throw new Error("Unsafe file path");
+    const segments = requestedPath.split("/").slice(1);
+    if (segments.some((segment) => !segment || segment === "." || segment === "..")) throw new Error("Unsafe file path");
     const root = this.instancePath(instanceId);
-    const target = resolve(root, `.${requestedPath}`);
+    await mkdir(root, { recursive: true });
+    const target = resolve(root, ...segments);
     const pathFromRoot = relative(root, target);
-    if (pathFromRoot.startsWith("..") || pathFromRoot === "" && requestedPath !== "/") throw new Error("Unsafe file path");
+    if (pathFromRoot.startsWith("..") || pathFromRoot === "") throw new Error("Unsafe file path");
+    let current = root;
+    for (let index = 0; index < segments.length; index += 1) {
+      current = resolve(current, segments[index]);
+      try {
+        const metadata = await lstat(current);
+        if (metadata.isSymbolicLink() || (index < segments.length - 1 && !metadata.isDirectory())) throw new Error("Unsafe file path");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") break;
+        throw error;
+      }
+    }
     return target;
+  }
+
+  private transferPath(transferId: string, suffix: "upload" | "download"): string {
+    if (!/^[a-z0-9-]{16,80}$/i.test(transferId)) throw new Error("Invalid file transfer id");
+    return resolve(this.dataRoot, "transfers", `${transferId}.${suffix}`);
   }
 
   private async listFiles(instanceId: string): Promise<Array<{ path: string; size: number; modifiedAt: string }>> {
@@ -265,7 +288,88 @@ export class DockerRuntime {
     }
   }
 
-  async execute(task: AgentTask): Promise<TaskResult> {
+  private async receiveFileTransfer(
+    instanceId: string,
+    path: string,
+    transfer: { id: string; fileName: string; token: string; sizeBytes?: number; checksum?: string },
+    reportProgress?: ProgressReporter
+  ): Promise<TaskResult> {
+    if (!this.controllerUrl) throw new Error("Agent controller URL is not configured");
+    const expectedSize = Number(transfer.sizeBytes);
+    if (!Number.isSafeInteger(expectedSize) || expectedSize < 0) throw new Error("Invalid file transfer size");
+    if (!/^[a-f0-9]{64}$/i.test(String(transfer.checksum ?? ""))) throw new Error("Invalid file transfer checksum");
+    const url = new URL(this.controllerUrl);
+    url.pathname = `${url.pathname.replace(/\/$/, "")}/api/agent/file-transfers/${transfer.id}`;
+    url.searchParams.set("token", transfer.token);
+    const response = await fetch(url);
+    if (!response.ok || !response.body) throw new Error(`文件下载失败：${response.status}`);
+    const declaredChecksum = response.headers.get("x-micopanel-checksum");
+    const declaredSize = Number(response.headers.get("content-length"));
+    if (declaredChecksum !== transfer.checksum || declaredSize !== expectedSize) throw new Error("文件传输元数据校验失败");
+    const temporary = this.transferPath(transfer.id, "upload");
+    const digest = createHash("sha256");
+    let bytes = 0;
+    let lastProgress = 10;
+    const monitor = new Transform({ transform(chunk, _encoding, callback) {
+      bytes += chunk.length;
+      const progress = expectedSize ? Math.min(90, 10 + Math.floor((bytes / expectedSize) * 80)) : 10;
+      if (progress >= lastProgress + 5) {
+        lastProgress = progress;
+        reportProgress?.("正在从控制端接收文件", progress);
+      }
+      digest.update(chunk);
+      callback(null, chunk);
+    } });
+    try {
+      await pipeline(Readable.fromWeb(response.body as unknown as Parameters<typeof Readable.fromWeb>[0]), monitor, createWriteStream(temporary, { flags: "w" }));
+      if (bytes !== expectedSize || digest.digest("hex") !== transfer.checksum) throw new Error("文件传输完整性校验失败");
+      const target = await this.safeFilePath(instanceId, path);
+      await mkdir(dirname(target), { recursive: true });
+      await rename(temporary, target);
+      return { message: `已上传 ${path}`, data: { sizeBytes: bytes, checksum: transfer.checksum } };
+    } finally {
+      await rm(temporary, { force: true });
+    }
+  }
+
+  private async sendFileTransfer(
+    instanceId: string,
+    path: string,
+    transfer: { id: string; fileName: string; token: string },
+    reportProgress?: ProgressReporter
+  ): Promise<TaskResult> {
+    if (!this.controllerUrl) throw new Error("Agent controller URL is not configured");
+    const source = await this.safeFilePath(instanceId, path);
+    const metadata = await lstat(source);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) throw new Error("只能下载普通文件");
+    const url = new URL(this.controllerUrl);
+    url.pathname = `${url.pathname.replace(/\/$/, "")}/api/agent/file-transfers/${transfer.id}`;
+    url.searchParams.set("token", transfer.token);
+    let bytes = 0;
+    let lastProgress = 10;
+    const monitor = new Transform({ transform(chunk, _encoding, callback) {
+      bytes += chunk.length;
+      const progress = metadata.size ? Math.min(90, 10 + Math.floor((bytes / metadata.size) * 80)) : 90;
+      if (progress >= lastProgress + 5) {
+        lastProgress = progress;
+        reportProgress?.("正在回传节点文件", progress);
+      }
+      callback(null, chunk);
+    } });
+    const sourceStream = createReadStream(source).pipe(monitor);
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/octet-stream", "content-length": String(metadata.size) },
+      body: Readable.toWeb(sourceStream) as unknown as BodyInit,
+      duplex: "half"
+    } as RequestInit & { duplex: "half" });
+    if (!response.ok) throw new Error(`文件回传失败：${response.status}`);
+    const result = await response.json() as { checksum?: unknown; sizeBytes?: unknown };
+    if (result.sizeBytes !== metadata.size || typeof result.checksum !== "string") throw new Error("控制端未确认文件回传");
+    return { message: `已准备下载 ${path}`, data: { sizeBytes: metadata.size, checksum: result.checksum } };
+  }
+
+  async execute(task: AgentTask, reportProgress?: ProgressReporter): Promise<TaskResult> {
     const rawInstance = task.payload.instance;
     const instance = rawInstance as InstanceSpec | undefined;
     switch (task.type) {
@@ -319,18 +423,31 @@ export class DockerRuntime {
       case "file.write": {
         const path = String(task.payload.path ?? "");
         const content = String(task.payload.content ?? "");
-        const target = this.safeFilePath(task.instanceId!, path);
+        const target = await this.safeFilePath(task.instanceId!, path);
         await mkdir(dirname(target), { recursive: true });
         await writeFile(target, content, "utf8");
         return { message: `已写入 ${path}` };
       }
       case "file.read": {
         const path = String(task.payload.path ?? "");
-        const target = this.safeFilePath(task.instanceId!, path);
+        const target = await this.safeFilePath(task.instanceId!, path);
         const metadata = await stat(target);
+        if (!metadata.isFile()) throw new Error("只能在编辑器中打开普通文件");
         if (metadata.size > 1_000_000) throw new Error("文件超过 1 MB，不能在面板编辑器中打开");
         const content = await readFile(target, "utf8");
         return { message: `已读取 ${path}`, data: { content } };
+      }
+      case "file.upload": {
+        const path = String(task.payload.path ?? "");
+        const transfer = task.payload.transfer as { id?: unknown; fileName?: unknown; token?: unknown; sizeBytes?: unknown; checksum?: unknown } | undefined;
+        if (!transfer || typeof transfer.id !== "string" || typeof transfer.fileName !== "string" || typeof transfer.token !== "string" || typeof transfer.sizeBytes !== "number" || typeof transfer.checksum !== "string") throw new Error("文件上传任务无效");
+        return this.receiveFileTransfer(task.instanceId!, path, { id: transfer.id, fileName: transfer.fileName, token: transfer.token, sizeBytes: transfer.sizeBytes, checksum: transfer.checksum }, reportProgress);
+      }
+      case "file.download": {
+        const path = String(task.payload.path ?? "");
+        const transfer = task.payload.transfer as { id?: unknown; fileName?: unknown; token?: unknown } | undefined;
+        if (!transfer || typeof transfer.id !== "string" || typeof transfer.fileName !== "string" || typeof transfer.token !== "string") throw new Error("文件下载任务无效");
+        return this.sendFileTransfer(task.instanceId!, path, { id: transfer.id, fileName: transfer.fileName, token: transfer.token }, reportProgress);
       }
       case "file.list": {
         return { message: "文件目录已同步", data: { files: await this.listFiles(task.instanceId!) } };

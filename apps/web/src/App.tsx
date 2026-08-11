@@ -4,6 +4,7 @@ import {
   Boxes,
   Cable,
   Check,
+  ChevronLeft,
   ChevronRight,
   CircleAlert,
   Clock3,
@@ -11,7 +12,10 @@ import {
   Command,
   Copy,
   DatabaseBackup,
+  Download,
   FileCode2,
+  FilePlus2,
+  Folder,
   FolderTree,
   HardDrive,
   LayoutDashboard,
@@ -24,6 +28,7 @@ import {
   Plus,
   Power,
   RotateCcw,
+  Save,
   ScrollText,
   Server,
   Settings2,
@@ -34,9 +39,9 @@ import {
   Users,
   X
 } from "lucide-react";
-import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from "react";
+import { type ChangeEvent, FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 import { api, ApiError, formatBytes, formatTime } from "./api";
-import type { Backup, Dashboard, Instance, InstanceDetail, Node, Schedule, Task, User } from "./types";
+import type { Backup, Dashboard, FileTransfer, Instance, InstanceDetail, Node, Schedule, Task, User } from "./types";
 
 type Screen = "overview" | "instances" | "nodes" | "tasks" | "backups" | "audit";
 type Modal = "node" | "instance" | null;
@@ -146,13 +151,16 @@ function ControlPanel({ user, onSignOut }: { user: User; onSignOut: () => Promis
       const payload = JSON.parse(event.data) as { type: string; instanceId?: string; line?: string };
       if (payload.type === "console.output" && payload.instanceId === selectedId && payload.line) {
         setDetail((current) => current ? { ...current, console: [...current.console.slice(-499), payload.line!] } : current);
-      } else void refresh();
+      } else {
+        void refresh();
+        if (selectedId) void refreshDetail(selectedId);
+      }
     };
     return () => socket.close();
-  }, [refresh, selectedId]);
+  }, [refresh, refreshDetail, selectedId]);
 
   const selected = dashboard?.instances.find((instance) => instance.id === selectedId);
-  const action = async (instance: Instance, name: "start" | "stop" | "restart" | "kill", command?: string) => {
+  const action = async (instance: Instance, name: "start" | "stop" | "restart" | "kill" | "command", command?: string) => {
     if (name === "kill" && !window.confirm(`强制停止 ${instance.name}？未保存的数据可能丢失。`)) return;
     try {
       await api(`/api/instances/${instance.id}/actions`, { method: "POST", body: JSON.stringify({ action: name, command }) });
@@ -228,19 +236,94 @@ function Backups({ backups, instances }: { backups: Backup[]; instances: Instanc
 
 function Audit({ events, allow }: { events: Array<{ id: string; action: string; target: string; detail?: string; createdAt: string }>; allow: boolean }) { if (!allow) return <section className="panel"><Empty icon={<ShieldCheck size={24} />} title="审计记录仅向管理员开放" /></section>; return <section className="panel table-panel"><div className="panel-heading"><div><p className="eyebrow">Security trail</p><h3>操作审计</h3></div></div>{events.length ? <div className="audit-list">{events.map((event) => <div className="audit-row" key={event.id}><ShieldCheck size={17} /><span><strong>{event.action}</strong><small>{event.target}{event.detail ? ` · ${event.detail}` : ""}</small></span><time>{formatTime(event.createdAt)}</time></div>)}</div> : <p className="quiet">尚未记录控制面操作。</p>}</section>; }
 
-function InstanceWorkspace({ detail, instance, onAction, notify, reload }: { detail?: InstanceDetail; instance: Instance; onAction: (instance: Instance, action: "start" | "stop" | "restart" | "kill", command?: string) => Promise<void>; notify: (message?: string) => void; reload: () => void }) {
+function InstanceWorkspace({ detail, instance, onAction, notify, reload }: { detail?: InstanceDetail; instance: Instance; onAction: (instance: Instance, action: "start" | "stop" | "restart" | "kill" | "command", command?: string) => Promise<void>; notify: (message?: string) => void; reload: () => void }) {
   const [tab, setTab] = useState<DetailTab>("console");
   const [command, setCommand] = useState("");
   const [files, setFiles] = useState<Array<{ path: string; content?: string; size: number; modifiedAt: string }>>([]);
+  const [directory, setDirectory] = useState("/");
+  const [editor, setEditor] = useState<{ path: string; content: string }>();
+  const [fileBusy, setFileBusy] = useState(false);
+  const [transfer, setTransfer] = useState<FileTransfer>();
   const [scheduleName, setScheduleName] = useState("");
   const [cron, setCron] = useState("0 4 * * *");
-  useEffect(() => { setTab("console"); }, [instance.id]);
+  useEffect(() => { setTab("console"); setDirectory("/"); setEditor(undefined); setTransfer(undefined); }, [instance.id]);
   useEffect(() => { setFiles(detail?.files ?? []); }, [detail]);
-  const sendCommand = async (event: FormEvent) => { event.preventDefault(); if (!command.trim()) return; await onAction(instance, "command" as never, command); setCommand(""); };
-  const loadFiles = async () => { try { await api(`/api/instances/${instance.id}/files/sync`, { method: "POST" }); setFiles((await api<{ files: typeof files }>(`/api/instances/${instance.id}/files`)).files); notify("文件同步任务已提交"); } catch (error) { notify(error instanceof Error ? error.message : "无法读取文件"); } };
+  useEffect(() => {
+    if (!transfer || !["queued", "receiving"].includes(transfer.status)) return;
+    let active = true;
+    const check = async () => {
+      try {
+        const result = await api<{ transfer: FileTransfer }>(`/api/instances/${instance.id}/file-transfers/${transfer.id}`);
+        if (active) setTransfer(result.transfer);
+      } catch (error) { if (active) notify(error instanceof Error ? error.message : "无法读取文件传输状态"); }
+    };
+    void check();
+    const timer = window.setInterval(() => void check(), 1000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [instance.id, notify, transfer]);
+  const entries = useMemo(() => {
+    const prefix = directory === "/" ? "/" : `${directory}/`;
+    const folders = new Set<string>();
+    const directFiles: typeof files = [];
+    for (const file of files) {
+      if (!file.path.startsWith(prefix)) continue;
+      const remainder = file.path.slice(prefix.length);
+      if (!remainder) continue;
+      const separator = remainder.indexOf("/");
+      if (separator >= 0) folders.add(`${prefix}${remainder.slice(0, separator)}`);
+      else directFiles.push(file);
+    }
+    return { folders: [...folders].sort(), files: directFiles.sort((left, right) => left.path.localeCompare(right.path)) };
+  }, [directory, files]);
+  const crumbs = directory === "/" ? [] : directory.slice(1).split("/");
+  const sendCommand = async (event: FormEvent) => { event.preventDefault(); if (!command.trim()) return; await onAction(instance, "command", command); setCommand(""); };
+  const loadFiles = async () => { try { await api(`/api/instances/${instance.id}/files/sync`, { method: "POST" }); notify("文件同步任务已提交"); } catch (error) { notify(error instanceof Error ? error.message : "无法读取文件"); } };
+  const openFile = async (file: { path: string }) => {
+    setFileBusy(true); setEditor({ path: file.path, content: "" });
+    try {
+      await api(`/api/instances/${instance.id}/files/read`, { method: "POST", body: JSON.stringify({ path: file.path }) });
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        await new Promise((resolvePromise) => window.setTimeout(resolvePromise, 300));
+        const result = await api<{ files: typeof files }>(`/api/instances/${instance.id}/files`);
+        const current = result.files.find((candidate) => candidate.path === file.path);
+        if (typeof current?.content === "string") { setFiles(result.files); setEditor({ path: file.path, content: current.content }); return; }
+      }
+      throw new Error("读取任务仍在等待节点响应");
+    } catch (error) { setEditor(undefined); notify(error instanceof Error ? error.message : "无法打开文件"); }
+    finally { setFileBusy(false); }
+  };
+  const saveFile = async () => {
+    if (!editor) return;
+    setFileBusy(true);
+    try {
+      await api(`/api/instances/${instance.id}/files`, { method: "PUT", body: JSON.stringify(editor) });
+      setFiles((current) => current.map((file) => file.path === editor.path ? { ...file, content: editor.content, size: new Blob([editor.content]).size, modifiedAt: new Date().toISOString() } : file));
+      notify("文件保存任务已提交");
+    } catch (error) { notify(error instanceof Error ? error.message : "文件未保存"); }
+    finally { setFileBusy(false); }
+  };
+  const uploadFile = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.currentTarget.files?.[0];
+    event.currentTarget.value = "";
+    if (!file) return;
+    const path = `${directory === "/" ? "" : directory}/${file.name}`;
+    setFileBusy(true);
+    try {
+      const body = new FormData(); body.append("file", file);
+      const result = await api<{ transfer: FileTransfer }>(`/api/instances/${instance.id}/files/upload?path=${encodeURIComponent(path)}`, { method: "POST", body });
+      setTransfer(result.transfer); notify(`正在上传 ${file.name}`);
+    } catch (error) { notify(error instanceof Error ? error.message : "文件未上传"); }
+    finally { setFileBusy(false); }
+  };
+  const requestDownload = async (path: string) => {
+    try {
+      const result = await api<{ transfer: FileTransfer }>(`/api/instances/${instance.id}/files/download`, { method: "POST", body: JSON.stringify({ path }) });
+      setTransfer(result.transfer); notify("正在从节点准备下载文件");
+    } catch (error) { notify(error instanceof Error ? error.message : "无法准备下载文件"); }
+  };
   const backup = async () => { try { await api(`/api/instances/${instance.id}/backups`, { method: "POST", body: JSON.stringify({ destination: "local" }) }); notify("备份任务已提交"); reload(); } catch (error) { notify(error instanceof Error ? error.message : "备份任务未完成"); } };
   const addSchedule = async (event: FormEvent) => { event.preventDefault(); try { await api(`/api/instances/${instance.id}/schedules`, { method: "POST", body: JSON.stringify({ name: scheduleName, cron, action: "backup", payload: {} }) }); setScheduleName(""); notify("计划任务已创建"); reload(); } catch (error) { notify(error instanceof Error ? error.message : "计划任务未创建"); } };
-  return <section className="instance-workspace"><div className="worktop"><div><span className="back-label">正在管理</span><h3>{instance.name}<Status value={statusText[instance.status]} status={instance.status} /></h3><p>{instance.kind} · {instance.version} · {instance.ports.map((port) => `${port.host}/${port.protocol}`).join(", ")}</p></div><div className="power-controls"><button className="icon-button action-good" title="启动" disabled={instance.status === "running" || instance.status === "starting"} onClick={() => void onAction(instance, "start")}><Play size={17} /></button><button className="icon-button" title="重启" onClick={() => void onAction(instance, "restart")}><RotateCcw size={17} /></button><button className="icon-button action-warn" title="停止" disabled={instance.status === "offline"} onClick={() => void onAction(instance, "stop")}><Pause size={17} /></button><button className="icon-button action-bad" title="强制停止" onClick={() => void onAction(instance, "kill")}><Power size={17} /></button></div></div><div className="detail-tabs">{(["console", "files", "backups", "schedules"] as DetailTab[]).map((item) => <button key={item} className={tab === item ? "active" : ""} onClick={() => { setTab(item); if (item === "files") void loadFiles(); }}>{item === "console" ? "控制台" : item === "files" ? "文件" : item === "backups" ? "备份" : "计划任务"}</button>)}</div>{tab === "console" && <div className="console-tool"><div className="console-head"><span><Terminal size={15} /> 实时控制台</span><span>{detail?.console.length ?? 0} 行</span></div><pre>{detail?.console.length ? detail.console.join("\n") : "等待节点输出..."}</pre><form onSubmit={sendCommand} className="command-line"><span>&gt;</span><input value={command} onChange={(event) => setCommand(event.target.value)} placeholder="输入服务器命令" /><button className="icon-button" title="发送命令" type="submit"><ChevronRight size={18} /></button></form></div>}{tab === "files" && <div className="file-tool"><div className="tool-title"><FolderTree size={18} /> 文件目录 <button className="icon-button" title="刷新文件" onClick={() => void loadFiles()}><RotateCcw size={16} /></button></div>{files.length ? files.map((file) => <article key={file.path}><FileCode2 size={17} /><span><strong>{file.path}</strong><small>{file.size} B</small></span></article>) : <p className="quiet">节点文件将在首次读取后显示。</p>}</div>}{tab === "backups" && <div className="backup-tool"><button className="button primary" onClick={() => void backup()}><DatabaseBackup size={17} />创建备份</button>{detail?.backups.length ? <Backups backups={detail.backups} instances={[instance]} /> : <p className="quiet">创建备份后可在此查看归档状态。</p>}</div>}{tab === "schedules" && <div className="schedule-tool"><form onSubmit={addSchedule}><label>任务名称<input value={scheduleName} required onChange={(event) => setScheduleName(event.target.value)} placeholder="每日备份" /></label><label>Cron<input value={cron} required onChange={(event) => setCron(event.target.value)} /></label><button className="button primary"><Plus size={16} />添加备份计划</button></form>{detail?.schedules.length ? detail.schedules.map((schedule: Schedule) => <div className="schedule-row" key={schedule.id}><Clock3 size={17} /><span><strong>{schedule.name}</strong><small>{schedule.cron} · 下次 {formatTime(schedule.nextRunAt)}</small></span><Status value={schedule.enabled ? "已启用" : "暂停"} status={schedule.enabled ? "running" : "offline"} /></div>) : <p className="quiet">还没有计划任务。</p>}</div>}</section>;
+  return <section className="instance-workspace"><div className="worktop"><div><span className="back-label">正在管理</span><h3>{instance.name}<Status value={statusText[instance.status]} status={instance.status} /></h3><p>{instance.kind} · {instance.version} · {instance.ports.map((port) => `${port.host}/${port.protocol}`).join(", ")}</p></div><div className="power-controls"><button className="icon-button action-good" title="启动" disabled={instance.status === "running" || instance.status === "starting"} onClick={() => void onAction(instance, "start")}><Play size={17} /></button><button className="icon-button" title="重启" onClick={() => void onAction(instance, "restart")}><RotateCcw size={17} /></button><button className="icon-button action-warn" title="停止" disabled={instance.status === "offline"} onClick={() => void onAction(instance, "stop")}><Pause size={17} /></button><button className="icon-button action-bad" title="强制停止" onClick={() => void onAction(instance, "kill")}><Power size={17} /></button></div></div><div className="detail-tabs">{(["console", "files", "backups", "schedules"] as DetailTab[]).map((item) => <button key={item} className={tab === item ? "active" : ""} onClick={() => { setTab(item); if (item === "files") void loadFiles(); }}>{item === "console" ? "控制台" : item === "files" ? "文件" : item === "backups" ? "备份" : "计划任务"}</button>)}</div>{tab === "console" && <div className="console-tool"><div className="console-head"><span><Terminal size={15} /> 实时控制台</span><span>{detail?.console.length ?? 0} 行</span></div><pre>{detail?.console.length ? detail.console.join("\n") : "等待节点输出..."}</pre><form onSubmit={sendCommand} className="command-line"><span>&gt;</span><input value={command} onChange={(event) => setCommand(event.target.value)} placeholder="输入服务器命令" /><button className="icon-button" title="发送命令" type="submit"><ChevronRight size={18} /></button></form></div>}{tab === "files" && <div className="file-tool file-manager"><div className="tool-title"><span><FolderTree size={18} /> 文件</span><span className="file-actions"><button className="icon-button" title="返回上级目录" disabled={directory === "/"} onClick={() => setDirectory(directory.slice(0, directory.lastIndexOf("/")) || "/")}><ChevronLeft size={16} /></button><label className="icon-button" title="上传到当前目录"><FilePlus2 size={16} /><input type="file" onChange={(event) => void uploadFile(event)} /></label><button className="icon-button" title="刷新文件" onClick={() => void loadFiles()}><RotateCcw size={16} /></button></span></div><div className="file-breadcrumb"><button onClick={() => setDirectory("/")} className={directory === "/" ? "current" : ""}>根目录</button>{crumbs.map((crumb, index) => { const path = `/${crumbs.slice(0, index + 1).join("/")}`; return <button key={path} onClick={() => setDirectory(path)} className={path === directory ? "current" : ""}>/{crumb}</button>; })}</div><div className="file-browser"> <div className="file-list">{entries.folders.map((path) => <button key={path} className="file-row folder-row" onClick={() => setDirectory(path)}><Folder size={17} /><span><strong>{path.slice(path.lastIndexOf("/") + 1)}</strong><small>目录</small></span><ChevronRight size={15} /></button>)}{entries.files.map((file) => <div className={`file-row ${editor?.path === file.path ? "selected" : ""}`} key={file.path}><button className="file-open" onClick={() => void openFile(file)}><FileCode2 size={17} /><span><strong>{file.path.slice(file.path.lastIndexOf("/") + 1)}</strong><small>{formatBytes(file.size)} · {formatTime(file.modifiedAt)}</small></span></button><button className="icon-button" title="下载文件" onClick={() => void requestDownload(file.path)}><Download size={15} /></button></div>)}{!entries.folders.length && !entries.files.length && <p className="quiet">当前目录为空</p>}</div><div className="file-editor">{editor ? <><div className="editor-head"><span>{fileBusy ? <LoaderCircle size={15} className="spin" /> : <FileCode2 size={15} />}{editor.path}</span><button className="button compact primary" disabled={fileBusy} onClick={() => void saveFile()}><Save size={15} />保存</button></div><textarea value={editor.content} spellCheck={false} onChange={(event) => setEditor({ ...editor, content: event.target.value })} /></> : <div className="editor-empty"><FileCode2 size={24} /><p>未选择文件</p></div>}</div></div>{transfer && <div className={`file-transfer ${transfer.status}`}><span>{transfer.status === "failed" ? <CircleAlert size={16} /> : transfer.status === "available" ? <Check size={16} /> : <LoaderCircle size={16} className="spin" />}</span><div><strong>{transfer.direction === "upload" ? "上传文件" : "准备下载"} · {transfer.fileName}</strong><small>{transfer.status === "available" ? "传输已完成" : transfer.status === "failed" ? transfer.error ?? "传输失败" : "正在等待节点处理"}</small></div>{transfer.direction === "download" && transfer.status === "available" && <a className="button compact" href={`/api/instances/${instance.id}/file-transfers/${transfer.id}/download`}><Download size={15} />下载</a>}</div>}</div>}{tab === "backups" && <div className="backup-tool"><button className="button primary" onClick={() => void backup()}><DatabaseBackup size={17} />创建备份</button>{detail?.backups.length ? <Backups backups={detail.backups} instances={[instance]} /> : <p className="quiet">创建备份后可在此查看归档状态。</p>}</div>}{tab === "schedules" && <div className="schedule-tool"><form onSubmit={addSchedule}><label>任务名称<input value={scheduleName} required onChange={(event) => setScheduleName(event.target.value)} placeholder="每日备份" /></label><label>Cron<input value={cron} required onChange={(event) => setCron(event.target.value)} /></label><button className="button primary"><Plus size={16} />添加备份计划</button></form>{detail?.schedules.length ? detail.schedules.map((schedule: Schedule) => <div className="schedule-row" key={schedule.id}><Clock3 size={17} /><span><strong>{schedule.name}</strong><small>{schedule.cron} · 下次 {formatTime(schedule.nextRunAt)}</small></span><Status value={schedule.enabled ? "已启用" : "暂停"} status={schedule.enabled ? "running" : "offline"} /></div>) : <p className="quiet">还没有计划任务。</p>}</div>}</section>;
 }
 
 function NodeModal({ onClose, refresh, notify }: { onClose: () => void; refresh: () => Promise<void>; notify: (message?: string) => void }) {

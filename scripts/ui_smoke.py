@@ -14,7 +14,9 @@ with sync_playwright() as p:
     )
     page = browser.new_page(viewport={"width": 1440, "height": 960})
     errors = []
+    failed_responses = []
     page.on("console", lambda message: errors.append(message.text) if message.type == "error" else None)
+    page.on("response", lambda response: failed_responses.append(f"{response.status} {response.url}") if response.status >= 400 else None)
 
     page.goto(os.environ.get("PANEL_URL", "http://127.0.0.1:5273"), wait_until="networkidle")
     page.get_by_label("用户名").fill("panel-admin")
@@ -47,11 +49,18 @@ with sync_playwright() as p:
     page.get_by_text("survival-01").first.wait_for()
     page.wait_for_timeout(450)
     assert page.locator(".instance-workspace").evaluate("element => getComputedStyle(element).opacity") == "1"
+    page.get_by_role("button", name="文件", exact=True).click()
+    page.locator(".file-manager").wait_for()
+    assert page.get_by_title("上传到当前目录").is_visible()
+    assert page.get_by_title("刷新文件").is_visible()
+    page.locator(".toast").click()
     page.screenshot(path=str(ARTIFACTS / "control-panel.png"), full_page=True)
     page.set_viewport_size({"width": 390, "height": 844})
+    page.locator(".file-manager").wait_for()
+    page.screenshot(path=str(ARTIFACTS / "control-panel-files-mobile.png"), full_page=True)
     page.get_by_title("打开导航").click()
     page.get_by_role("button", name="节点").click()
     page.screenshot(path=str(ARTIFACTS / "control-panel-mobile.png"), full_page=True)
 
-    assert not errors, f"Browser console errors: {errors}"
+    assert not errors, f"Browser console errors: {errors}; failed responses: {failed_responses}"
     browser.close()

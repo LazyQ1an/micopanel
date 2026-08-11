@@ -17,6 +17,7 @@ const normalizeState = (state: PanelState): PanelState => {
     instance.fileIndex ??= [];
   }
   state.artifacts ??= [];
+  state.fileTransfers ??= [];
   return state;
 };
 
