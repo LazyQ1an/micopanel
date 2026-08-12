@@ -71,6 +71,16 @@ export interface Schedule {
   nextRunAt?: string;
 }
 
+export interface MetricPoint {
+  capturedAt: string;
+  cpuPercent: number;
+  memoryBytes: number;
+  memoryLimitBytes: number;
+  networkRxBytes: number;
+  networkTxBytes: number;
+  pids?: number;
+}
+
 export interface FileTransfer {
   id: string;
   instanceId: string;

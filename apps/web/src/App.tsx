@@ -17,6 +17,7 @@ import {
   FilePlus2,
   Folder,
   FolderTree,
+  Gauge,
   HardDrive,
   LayoutDashboard,
   LoaderCircle,
@@ -59,6 +60,7 @@ import type {
   Instance,
   InstanceDetail,
   MemberDirectory,
+  MetricPoint,
   Node,
   Schedule,
   Task,
@@ -69,7 +71,7 @@ import type { Permission } from "@micopanel/protocol";
 type Screen =
   "overview" | "instances" | "nodes" | "tasks" | "backups" | "audit";
 type Modal = "node" | "instance" | null;
-type DetailTab = "console" | "config" | "files" | "backups" | "schedules" | "members";
+type DetailTab = "console" | "metrics" | "config" | "files" | "backups" | "schedules" | "members";
 
 const permissionLabels: Record<Permission, string> = {
   "instance.view": "查看实例",
@@ -1366,7 +1368,7 @@ function InstanceWorkspace({
         </div>
       </div>
       <div className="detail-tabs">
-        {(["console", "config", "files", "backups", "schedules", "members"] as DetailTab[]).map(
+        {(["console", "metrics", "config", "files", "backups", "schedules", "members"] as DetailTab[]).map(
           (item) => (
             <button
               key={item}
@@ -1378,6 +1380,8 @@ function InstanceWorkspace({
             >
               {item === "console"
                 ? "控制台"
+                : item === "metrics"
+                  ? "资源"
                 : item === "config"
                   ? "配置"
                   : item === "files"
@@ -1417,6 +1421,7 @@ function InstanceWorkspace({
           </form>
         </div>
       )}
+      {tab === "metrics" && <InstanceMetrics instance={instance} />}
       {tab === "config" && <ConfigurationTool detail={detail} instance={instance} node={node} notify={notify} reload={reload} />}
       {tab === "files" && (
         <div className="file-tool file-manager">
@@ -1613,6 +1618,92 @@ function InstanceWorkspace({
         </div>
       )}
     </section>
+  );
+}
+
+function InstanceMetrics({ instance }: { instance: Instance }) {
+  const [minutes, setMinutes] = useState(60);
+  const [points, setPoints] = useState<MetricPoint[]>([]);
+  const [error, setError] = useState<string>();
+
+  useEffect(() => {
+    let active = true;
+    const load = async () => {
+      try {
+        const result = await api<{ metrics: MetricPoint[] }>(`/api/instances/${instance.id}/metrics?minutes=${minutes}`);
+        if (active) {
+          setPoints(result.metrics);
+          setError(undefined);
+        }
+      } catch (loadError) {
+        if (active) setError(loadError instanceof Error ? loadError.message : "资源曲线暂时无法读取");
+      }
+    };
+    void load();
+    const timer = window.setInterval(() => void load(), 30_000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [instance.id, minutes]);
+
+  const latest = points[points.length - 1];
+  return (
+    <div className="metrics-tool">
+      <div className="tool-title">
+        <span><Gauge size={18} /> 资源曲线</span>
+        <span>{points.length ? `${points.length} 个采样` : "等待节点上报"}</span>
+      </div>
+      <div className="metrics-toolbar">
+        <span>时间范围</span>
+        {[15, 60, 360, 1440].map((range) => (
+          <button key={range} type="button" className={minutes === range ? "selected" : ""} onClick={() => setMinutes(range)}>
+            {range < 60 ? `${range} 分钟` : range === 60 ? "1 小时" : range === 360 ? "6 小时" : "24 小时"}
+          </button>
+        ))}
+      </div>
+      <div className="metrics-summary">
+        <MetricReadout label="CPU" value={latest ? `${latest.cpuPercent.toFixed(1)}%` : "--"} />
+        <MetricReadout label="内存" value={latest ? `${formatBytes(latest.memoryBytes)} / ${formatBytes(latest.memoryLimitBytes)}` : "--"} />
+        <MetricReadout label="累计 RX" value={latest ? formatBytes(latest.networkRxBytes) : "--"} />
+        <MetricReadout label="PID" value={latest?.pids === undefined ? "--" : String(latest.pids)} />
+      </div>
+      {error ? <p className="metric-error">{error}</p> : null}
+      <div className="metric-charts">
+        <MetricChart title="CPU 使用率" points={points.map((point) => point.cpuPercent)} suffix="%" color="#56d59b" max={100} />
+        <MetricChart title="内存占用" points={points.map((point) => point.memoryBytes)} suffix="" color="#e4b45b" max={Math.max(1, ...points.map((point) => point.memoryLimitBytes))} format={formatBytes} />
+      </div>
+      {!points.length && !error ? <p className="metric-empty">暂无采样数据，节点连接并上报后会显示曲线。</p> : null}
+    </div>
+  );
+}
+
+function MetricReadout({ label, value }: { label: string; value: string }) {
+  return <div className="metric-readout"><small>{label}</small><strong>{value}</strong></div>;
+}
+
+function MetricChart({ title, points, suffix, color, max, format = (value: number) => value.toFixed(0) }: { title: string; points: number[]; suffix: string; color: string; max: number; format?: (value: number) => string }) {
+  const width = 640;
+  const height = 180;
+  const padding = 16;
+  const chartHeight = height - padding * 2;
+  const chartWidth = width - padding * 2;
+  const path = points.map((point, index) => {
+    const x = points.length === 1 ? width / 2 : padding + (index / (points.length - 1)) * chartWidth;
+    const y = height - padding - Math.min(1, Math.max(0, point / Math.max(1, max))) * chartHeight;
+    return `${index ? "L" : "M"}${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+  return (
+    <article className="metric-chart">
+      <div className="metric-chart-head"><strong>{title}</strong><small>{points.length ? `${format(points[points.length - 1])}${suffix}` : "暂无数据"}</small></div>
+      {points.length ? (
+        <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={title} preserveAspectRatio="none">
+          <line x1={padding} x2={width - padding} y1={height - padding} y2={height - padding} />
+          <line x1={padding} x2={width - padding} y1={padding} y2={padding} />
+          <path d={path} style={{ stroke: color }} />
+        </svg>
+      ) : <div className="metric-chart-empty">等待节点连接</div>}
+    </article>
   );
 }
 

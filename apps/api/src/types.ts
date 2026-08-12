@@ -1,5 +1,15 @@
 import type { InstanceSpec, NodeUsage, Permission, TaskStatus, TaskType } from "@micopanel/protocol";
 
+export interface MetricPoint {
+  capturedAt: string;
+  cpuPercent: number;
+  memoryBytes: number;
+  memoryLimitBytes: number;
+  networkRxBytes: number;
+  networkTxBytes: number;
+  pids?: number;
+}
+
 export type UserRole = "admin" | "user";
 
 export interface User {

@@ -50,7 +50,7 @@ import {
 } from "./service.js";
 import { createStore, type StateStore } from "./store.js";
 import { SERVER_TEMPLATES } from "./templates.js";
-import type { ArtifactRecord, BackupRecord, FileTransferRecord, InstanceRecord, ManagedFile, NodeRecord, ScheduleRecord, TaskRecord, User } from "./types.js";
+import type { ArtifactRecord, BackupRecord, FileTransferRecord, InstanceRecord, ManagedFile, MetricPoint, NodeRecord, ScheduleRecord, TaskRecord, User } from "./types.js";
 
 type SocketLike = {
   readyState: number;
@@ -66,6 +66,15 @@ const sessionLifetimeMs = 1000 * 60 * 60 * 24 * 14;
 const archiveRetentionMs = 1000 * 60 * 60 * 24 * 7;
 const now = (): string => new Date().toISOString();
 const transferPublic = ({ tokenHash: _tokenHash, ...transfer }: FileTransferRecord) => transfer;
+const metricPoint = (usage: { cpuPercent: number; memoryBytes: number; memoryLimitBytes: number; networkRxBytes: number; networkTxBytes: number }, capturedAt: string, pids?: number): MetricPoint => ({
+  capturedAt,
+  cpuPercent: Number.isFinite(usage.cpuPercent) ? Math.max(0, usage.cpuPercent) : 0,
+  memoryBytes: Number.isFinite(usage.memoryBytes) ? Math.max(0, usage.memoryBytes) : 0,
+  memoryLimitBytes: Number.isFinite(usage.memoryLimitBytes) ? Math.max(0, usage.memoryLimitBytes) : 0,
+  networkRxBytes: Number.isFinite(usage.networkRxBytes) ? Math.max(0, usage.networkRxBytes) : 0,
+  networkTxBytes: Number.isFinite(usage.networkTxBytes) ? Math.max(0, usage.networkTxBytes) : 0,
+  pids: typeof pids === "number" && Number.isFinite(pids) ? Math.max(0, Math.floor(pids)) : undefined
+});
 
 const markTaskForRetry = (task: TaskRecord, reason: string): boolean => {
   if (!isAutomaticRetryableTask(task) || task.attempt >= MAX_TASK_ATTEMPTS) return false;
@@ -128,6 +137,7 @@ const instanceSchema = z.object({
 });
 const actionSchema = z.object({ action: z.enum(["start", "stop", "restart", "kill", "command"]), command: z.string().min(1).max(2000).optional() });
 const backupSchema = z.object({ destination: z.enum(["local", "s3"]).default("local") });
+const metricsQuerySchema = z.object({ minutes: z.coerce.number().int().min(15).max(1_440).default(180) });
 const scheduleActionSchema = z.discriminatedUnion("action", [
   z.object({ action: z.literal("command"), payload: z.object({ command: z.string().min(1).max(2000) }) }),
   z.object({ action: z.literal("backup"), payload: z.object({ destination: z.enum(["local", "s3"]).default("local") }).default({}) }),
@@ -444,6 +454,23 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
         node.lastSeenAt = now();
         node.usage = message.usage;
       });
+      const workload = message.usage.workloads;
+      if (workload && !Number.isNaN(Date.parse(workload.capturedAt))) {
+        try {
+          const state = await store.read();
+          const instanceIds = new Set(state.instances.filter((instance) => instance.nodeId === connectedNodeId).map((instance) => instance.id));
+          await store.appendMetrics({
+            nodeId: connectedNodeId,
+            capturedAt: workload.capturedAt,
+            node: metricPoint(message.usage, workload.capturedAt),
+            instances: Object.entries(workload.instances ?? {})
+              .filter(([instanceId]) => instanceIds.has(instanceId))
+              .map(([instanceId, usage]) => ({ instanceId, point: metricPoint(usage, workload.capturedAt, usage.pids) }))
+          });
+        } catch {
+          // Metrics are supplementary; a storage hiccup must not disconnect a healthy Agent.
+        }
+      }
       hub.broadcast({ type: "node.updated", nodeId: connectedNodeId, online: true, usage: message.usage });
       return connectedNodeId;
     }
@@ -666,6 +693,16 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
     return { nodes: state.nodes.map(nodePublic) };
   });
 
+  app.get("/api/nodes/:id/metrics", async (request, reply) => {
+    const user = await getCurrentUser(request);
+    if (!user) return unauthenticated(reply);
+    if (!isAdmin(user)) return forbidden(reply);
+    const nodeId = (request.params as { id: string }).id;
+    if (!(await store.read()).nodes.some((node) => node.id === nodeId)) return notFound(reply, "节点不存在");
+    const input = metricsQuerySchema.parse(request.query);
+    return { metrics: await store.getMetrics("node", nodeId, new Date(Date.now() - input.minutes * 60_000)) };
+  });
+
   app.post("/api/nodes", async (request, reply) => {
     const user = await getCurrentUser(request);
     if (!user) return unauthenticated(reply);
@@ -766,6 +803,13 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
       backups: state.backups.filter((backup) => backup.instanceId === access.instance!.id),
       schedules: state.schedules.filter((schedule) => schedule.instanceId === access.instance!.id)
     };
+  });
+
+  app.get("/api/instances/:id/metrics", async (request, reply) => {
+    const access = await getInstanceAccess(request, reply, "instance.view");
+    if (!access.instance) return access.response;
+    const input = metricsQuerySchema.parse(request.query);
+    return { metrics: await store.getMetrics("instance", access.instance.id, new Date(Date.now() - input.minutes * 60_000)) };
   });
 
   app.get("/api/instances/:id/members", async (request, reply) => {

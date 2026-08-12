@@ -65,6 +65,19 @@ test("control plane bootstraps, queues workloads, and archives safely", async ()
     assert.equal(instanceBody.task.status, "queued");
     assert.equal(instanceBody.task.type, "instance.create");
     assert.equal(instanceBody.instance.ports[0].host, 25565);
+    const capturedAt = new Date().toISOString();
+    await store.appendMetrics({
+      nodeId: nodeBody.node.id,
+      capturedAt,
+      node: { capturedAt, cpuPercent: 21, memoryBytes: 2_000, memoryLimitBytes: 4_000, networkRxBytes: 100, networkTxBytes: 80 },
+      instances: [{ instanceId: instanceBody.instance.id, point: { capturedAt, cpuPercent: 8, memoryBytes: 700, memoryLimitBytes: 2_048, networkRxBytes: 50, networkTxBytes: 40, pids: 23 } }]
+    });
+    const instanceMetrics = await app.inject({ method: "GET", url: `/api/instances/${instanceBody.instance.id}/metrics?minutes=15`, headers: { cookie } });
+    assert.equal(instanceMetrics.statusCode, 200);
+    assert.equal(instanceMetrics.json().metrics[0].pids, 23);
+    const nodeMetrics = await app.inject({ method: "GET", url: `/api/nodes/${nodeBody.node.id}/metrics?minutes=15`, headers: { cookie } });
+    assert.equal(nodeMetrics.statusCode, 200);
+    assert.equal(nodeMetrics.json().metrics[0].cpuPercent, 21);
 
     const configWithoutConfirmation = await app.inject({
       method: "PUT",

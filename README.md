@@ -94,6 +94,13 @@ destination. The control plane records the backup and submits the actual work to
 the schedule becomes due. Disabling a schedule clears its next run time; enabling it calculates a
 fresh run time from the stored cron expression.
 
+## Resource metrics
+
+Agents send host health every five seconds and sample managed container CPU, memory, network, and
+PID usage every thirty seconds. The control plane stores those samples separately from the JSON
+configuration state and retains 24 hours. Instance collaborators with `instance.view` can read
+their instance curve; node history remains administrator-only.
+
 ## Task reliability
 
 The control plane retains task state across restarts and requeues work that was delivered when an

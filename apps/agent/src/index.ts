@@ -1,7 +1,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import WebSocket from "ws";
-import type { AgentInboundMessage, AgentOutboundMessage, AgentTask, NodeUsage } from "@micopanel/protocol";
+import type { AgentInboundMessage, AgentOutboundMessage, AgentTask, NodeUsage, WorkloadMetricSample } from "@micopanel/protocol";
 import { loadConfig } from "./config.js";
 import { DockerRuntime } from "./runtime.js";
 import { TaskJournal } from "./task-journal.js";
@@ -36,6 +36,7 @@ class Agent {
   private retryDelay = 1000;
   private taskChain = Promise.resolve();
   private heartbeat?: NodeJS.Timeout;
+  private nextWorkloadSampleAt = 0;
   private readonly runtime = new DockerRuntime(config.DOCKER_SOCKET, config.DATA_ROOT, (instanceId, line) => this.send({ type: "console.output", instanceId, line }), config.s3, config.CONTROLLER_URL);
   private readonly taskJournal = new TaskJournal(resolve(config.DATA_ROOT, "task-journal.json"));
 
@@ -77,7 +78,16 @@ class Agent {
   private async sendHeartbeat(): Promise<void> {
     try {
       const usage: NodeUsage = await this.runtime.usage();
-      this.send({ type: "heartbeat", usage });
+      let workloads: WorkloadMetricSample | undefined;
+      if (Date.now() >= this.nextWorkloadSampleAt) {
+        this.nextWorkloadSampleAt = Date.now() + 30_000;
+        try {
+          workloads = { capturedAt: new Date().toISOString(), instances: await this.runtime.instanceUsage() };
+        } catch {
+          // Container stats are best-effort; host heartbeats must continue when Docker is busy.
+        }
+      }
+      this.send({ type: "heartbeat", usage: workloads ? { ...usage, workloads } : usage });
     } catch {
       // Docker can transiently restart; the following heartbeat will recover the state.
     }

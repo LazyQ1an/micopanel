@@ -90,6 +90,20 @@ export type AgentOutboundMessage =
   | { type: "task"; task: AgentTask }
   | { type: "error"; message: string };
 
+export interface InstanceUsage {
+  cpuPercent: number;
+  memoryBytes: number;
+  memoryLimitBytes: number;
+  networkRxBytes: number;
+  networkTxBytes: number;
+  pids?: number;
+}
+
+export interface WorkloadMetricSample {
+  capturedAt: string;
+  instances: Record<string, InstanceUsage>;
+}
+
 export interface NodeUsage {
   cpuCores: number;
   cpuPercent: number;
@@ -99,6 +113,7 @@ export interface NodeUsage {
   diskLimitBytes: number;
   networkRxBytes: number;
   networkTxBytes: number;
+  workloads?: WorkloadMetricSample;
 }
 
 export type UiEvent =

@@ -9,7 +9,7 @@ import { GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3
 import AdmZip from "adm-zip";
 import Docker from "dockerode";
 import * as tar from "tar";
-import type { AgentTask, InstanceSpec, NodeUsage } from "@micopanel/protocol";
+import type { AgentTask, InstanceSpec, InstanceUsage, NodeUsage } from "@micopanel/protocol";
 import type { S3Config } from "./config.js";
 
 export interface TaskResult {
@@ -18,6 +18,32 @@ export interface TaskResult {
 }
 
 type ProgressReporter = (message: string, progress: number) => void;
+
+export interface ContainerStatsSnapshot {
+  cpu_stats?: { cpu_usage?: { total_usage?: number }; system_cpu_usage?: number; online_cpus?: number };
+  precpu_stats?: { cpu_usage?: { total_usage?: number }; system_cpu_usage?: number };
+  memory_stats?: { usage?: number; limit?: number; stats?: { cache?: number } };
+  networks?: Record<string, { rx_bytes?: number; tx_bytes?: number }>;
+  pids_stats?: { current?: number };
+}
+
+export function instanceUsageFromStats(stats: ContainerStatsSnapshot): InstanceUsage {
+  const cpu = stats.cpu_stats ?? {};
+  const previous = stats.precpu_stats ?? {};
+  const cpuDelta = (cpu.cpu_usage?.total_usage ?? 0) - (previous.cpu_usage?.total_usage ?? 0);
+  const systemDelta = (cpu.system_cpu_usage ?? 0) - (previous.system_cpu_usage ?? 0);
+  const cpuCount = Math.max(1, cpu.online_cpus ?? cpus().length);
+  const cpuPercent = systemDelta > 0 ? Math.max(0, Math.min(100, (cpuDelta / systemDelta) * cpuCount * 100)) : 0;
+  const memory = stats.memory_stats ?? {};
+  const memoryBytes = Math.max(0, (memory.usage ?? 0) - (memory.stats?.cache ?? 0));
+  let networkRxBytes = 0;
+  let networkTxBytes = 0;
+  for (const network of Object.values(stats.networks ?? {})) {
+    networkRxBytes += network.rx_bytes ?? 0;
+    networkTxBytes += network.tx_bytes ?? 0;
+  }
+  return { cpuPercent, memoryBytes, memoryLimitBytes: memory.limit ?? 0, networkRxBytes, networkTxBytes, pids: stats.pids_stats?.current };
+}
 
 export class DockerRuntime {
   private readonly docker: Docker;
@@ -531,5 +557,22 @@ export class DockerRuntime {
       networkRxBytes,
       networkTxBytes
     };
+  }
+
+  async instanceUsage(): Promise<Record<string, InstanceUsage>> {
+    const containers = await this.docker.listContainers({ all: true, filters: { label: ["io.micopanel.managed=true"] } });
+    const samples = await Promise.all(containers.map(async (listed) => {
+      const instanceId = listed.Labels?.["io.micopanel.instance"];
+      if (!instanceId) return undefined;
+      try {
+        const stats = await this.docker.getContainer(listed.Id).stats({ stream: false }) as unknown as ContainerStatsSnapshot;
+        return [instanceId, instanceUsageFromStats(stats)] as const;
+      } catch {
+        return undefined;
+      }
+    }));
+    const entries: Array<readonly [string, InstanceUsage]> = [];
+    for (const sample of samples) if (sample) entries.push([sample[0], sample[1]]);
+    return Object.fromEntries(entries);
   }
 }
