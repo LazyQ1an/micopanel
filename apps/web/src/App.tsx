@@ -13,6 +13,8 @@ import {
   Copy,
   DatabaseBackup,
   Download,
+  Eye,
+  EyeOff,
   FileCode2,
   FilePlus2,
   Folder,
@@ -50,6 +52,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import { api, ApiError, formatBytes, formatTime } from "./api";
@@ -72,6 +75,7 @@ type Screen =
   "overview" | "instances" | "nodes" | "tasks" | "backups" | "audit";
 type Modal = "node" | "instance" | null;
 type DetailTab = "console" | "metrics" | "config" | "files" | "backups" | "schedules" | "members";
+type Toast = { text: string; tone: "success" | "error" };
 
 const permissionLabels: Record<Permission, string> = {
   "instance.view": "查看实例",
@@ -266,7 +270,13 @@ function ControlPanel({
   const [selectedNodeId, setSelectedNodeId] = useState<string>();
   const [detail, setDetail] = useState<InstanceDetail>();
   const [modal, setModal] = useState<Modal>(null);
-  const [message, setMessage] = useState<string>();
+  const [confirm, setConfirm] = useState<{
+    title: string;
+    body: string;
+    confirmLabel: string;
+    run: () => Promise<void>;
+  }>();
+  const [toast, setToast] = useState<Toast>();
   const [audit, setAudit] = useState<
     Array<{
       id: string;
@@ -276,6 +286,13 @@ function ControlPanel({
       createdAt: string;
     }>
   >([]);
+
+  const notify = useCallback(
+    (message?: string, tone: Toast["tone"] = "success") => {
+      if (message) setToast({ text: message, tone });
+    },
+    [],
+  );
 
   const refresh = useCallback(async () => {
     try {
@@ -292,7 +309,7 @@ function ControlPanel({
           : next.nodes[0]?.id,
       );
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "无法刷新控制面");
+      notify(error instanceof Error ? error.message : "无法刷新控制面", "error");
     }
   }, []);
 
@@ -300,7 +317,7 @@ function ControlPanel({
     try {
       setDetail(await api<InstanceDetail>(`/api/instances/${instanceId}`));
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "无法加载实例");
+      notify(error instanceof Error ? error.message : "无法加载实例", "error");
     }
   }, []);
 
@@ -342,6 +359,11 @@ function ControlPanel({
     };
     return () => socket.close();
   }, [refresh, refreshDetail, selectedId]);
+  useEffect(() => {
+    if (!toast) return;
+    const timer = window.setTimeout(() => setToast(undefined), 4200);
+    return () => window.clearTimeout(timer);
+  }, [toast]);
 
   const selected = dashboard?.instances.find(
     (instance) => instance.id === selectedId,
@@ -351,29 +373,47 @@ function ControlPanel({
     name: "start" | "stop" | "restart" | "kill" | "command",
     command?: string,
   ) => {
-    if (
-      name === "kill" &&
-      !window.confirm(`强制停止 ${instance.name}？未保存的数据可能丢失。`)
-    )
+    if (name === "kill") {
+      setConfirm({
+        title: "强制停止实例",
+        body: `确定强制停止 “${instance.name}” 吗？未保存的数据可能丢失，且无法通过常规停止流程恢复。`,
+        confirmLabel: "强制停止",
+        run: async () => {
+          try {
+            await api(`/api/instances/${instance.id}/actions`, {
+              method: "POST",
+              body: JSON.stringify({ action: name, command }),
+            });
+            notify(`${instance.name}：强制停止任务已提交`);
+            void refresh();
+          } catch (error) {
+            notify(
+              error instanceof Error ? error.message : "操作未完成",
+              "error",
+            );
+          }
+        },
+      });
       return;
+    }
     try {
       await api(`/api/instances/${instance.id}/actions`, {
         method: "POST",
         body: JSON.stringify({ action: name, command }),
       });
-      setMessage(`${instance.name}：任务已提交`);
+      notify(`${instance.name}：任务已提交`);
       void refresh();
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "操作未完成");
+      notify(error instanceof Error ? error.message : "操作未完成", "error");
     }
   };
   const retryTask = async (task: Task) => {
     try {
       await api(`/api/tasks/${task.id}/retry`, { method: "POST" });
-      setMessage(`${task.type}：重试任务已提交`);
+      notify(`${task.type}：重试任务已提交`);
       void refresh();
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "任务未能重新提交");
+      notify(error instanceof Error ? error.message : "任务未能重新提交", "error");
     }
   };
   const signOut = async () => {
@@ -384,7 +424,7 @@ function ControlPanel({
     try {
       setAudit((await api<{ audits: typeof audit }>("/api/audit")).audits);
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "无法读取审计记录");
+      notify(error instanceof Error ? error.message : "无法读取审计记录", "error");
     }
   };
   useEffect(() => {
@@ -480,8 +520,19 @@ function ControlPanel({
           </div>
         </header>
         {!dashboard ? (
-          <div className="page-loading">
-            <LoaderCircle className="spin" size={22} /> 正在载入运行状态
+          <div className="page-loading skeleton-loading">
+            <span className="skeleton-loading-title">
+              <LoaderCircle className="spin" size={16} /> 正在载入运行状态
+            </span>
+            <div className="skeleton-metrics">
+              {Array.from({ length: 4 }, (_, index) => (
+                <div key={index} className="skeleton" />
+              ))}
+            </div>
+            <div className="skeleton-panels">
+              <div className="skeleton" />
+              <div className="skeleton" />
+            </div>
           </div>
         ) : (
           <section className="page-content">
@@ -532,7 +583,7 @@ function ControlPanel({
                 instance={selected}
                 node={dashboard.nodes.find((node) => node.id === selected.nodeId)}
                 onAction={action}
-                notify={setMessage}
+                notify={notify}
                 reload={() => {
                   void refresh();
                   void refreshDetail(selected.id);
@@ -546,7 +597,7 @@ function ControlPanel({
         <NodeModal
           onClose={() => setModal(null)}
           refresh={refresh}
-          notify={setMessage}
+          notify={notify}
         />
       )}
       {modal === "instance" && dashboard && (
@@ -554,16 +605,34 @@ function ControlPanel({
           nodes={dashboard.nodes}
           onClose={() => setModal(null)}
           refresh={refresh}
-          notify={setMessage}
+          notify={notify}
         />
       )}
-      {message && (
-        <button className="toast" onClick={() => setMessage(undefined)}>
-          <Check size={16} />
-          {message}
-          <X size={15} />
-        </button>
+      {confirm && (
+        <ConfirmDialog
+          title={confirm.title}
+          body={confirm.body}
+          confirmLabel={confirm.confirmLabel}
+          onConfirm={confirm.run}
+          onCancel={() => setConfirm(undefined)}
+        />
       )}
+      <div className="toast-stack">
+        {toast && (
+          <button
+            className={`toast ${toast.tone === "error" ? "error" : ""}`}
+            onClick={() => setToast(undefined)}
+          >
+            {toast.tone === "error" ? (
+              <CircleAlert size={16} />
+            ) : (
+              <Check size={16} />
+            )}
+            <span>{toast.text}</span>
+            <X size={15} />
+          </button>
+        )}
+      </div>
     </div>
   );
 }
@@ -1222,7 +1291,7 @@ function InstanceWorkspace({
     action: "start" | "stop" | "restart" | "kill" | "command",
     command?: string,
   ) => Promise<void>;
-  notify: (message?: string) => void;
+  notify: (message?: string, tone?: "success" | "error") => void;
   reload: () => void;
 }) {
   const [tab, setTab] = useState<DetailTab>("console");
@@ -1256,6 +1325,7 @@ function InstanceWorkspace({
         if (active)
           notify(
             error instanceof Error ? error.message : "无法读取文件传输状态",
+            "error",
           );
       }
     };
@@ -1298,7 +1368,7 @@ function InstanceWorkspace({
       await api(`/api/instances/${instance.id}/files/sync`, { method: "POST" });
       notify("文件同步任务已提交");
     } catch (error) {
-      notify(error instanceof Error ? error.message : "无法读取文件");
+      notify(error instanceof Error ? error.message : "无法读取文件", "error");
     }
   };
   const openFile = async (file: { path: string }) => {
@@ -1328,7 +1398,7 @@ function InstanceWorkspace({
       throw new Error("读取任务仍在等待节点响应");
     } catch (error) {
       setEditor(undefined);
-      notify(error instanceof Error ? error.message : "无法打开文件");
+      notify(error instanceof Error ? error.message : "无法打开文件", "error");
     } finally {
       setFileBusy(false);
     }
@@ -1355,7 +1425,7 @@ function InstanceWorkspace({
       );
       notify("文件保存任务已提交");
     } catch (error) {
-      notify(error instanceof Error ? error.message : "文件未保存");
+      notify(error instanceof Error ? error.message : "文件未保存", "error");
     } finally {
       setFileBusy(false);
     }
@@ -1376,7 +1446,7 @@ function InstanceWorkspace({
       setTransfer(result.transfer);
       notify(`正在上传 ${file.name}`);
     } catch (error) {
-      notify(error instanceof Error ? error.message : "文件未上传");
+      notify(error instanceof Error ? error.message : "文件未上传", "error");
     } finally {
       setFileBusy(false);
     }
@@ -1390,7 +1460,7 @@ function InstanceWorkspace({
       setTransfer(result.transfer);
       notify("正在从节点准备下载文件");
     } catch (error) {
-      notify(error instanceof Error ? error.message : "无法准备下载文件");
+      notify(error instanceof Error ? error.message : "无法准备下载文件", "error");
     }
   };
   const backup = async () => {
@@ -1402,7 +1472,7 @@ function InstanceWorkspace({
       notify("备份任务已提交");
       reload();
     } catch (error) {
-      notify(error instanceof Error ? error.message : "备份任务未完成");
+      notify(error instanceof Error ? error.message : "备份任务未完成", "error");
     }
   };
   return (
@@ -1807,7 +1877,7 @@ function ScheduleTool({
 }: {
   detail?: InstanceDetail;
   instance: Instance;
-  notify: (message?: string) => void;
+  notify: (message?: string, tone?: "success" | "error") => void;
   reload: () => void;
 }) {
   const [name, setName] = useState("");
@@ -1861,7 +1931,7 @@ function ScheduleTool({
       reset();
       reload();
     } catch (error) {
-      notify(error instanceof Error ? error.message : "计划任务未保存");
+      notify(error instanceof Error ? error.message : "计划任务未保存", "error");
     } finally {
       setBusy(false);
     }
@@ -1890,21 +1960,23 @@ function ScheduleTool({
       notify(enabled ? "计划任务已启用" : "计划任务已暂停");
       reload();
     } catch (error) {
-      notify(error instanceof Error ? error.message : "计划任务状态未更新");
+      notify(error instanceof Error ? error.message : "计划任务状态未更新", "error");
     } finally {
       setBusy(false);
     }
   };
-  const remove = async (schedule: Schedule) => {
-    if (!window.confirm(`删除计划任务“${schedule.name}”？`)) return;
+  const [confirmRemove, setConfirmRemove] = useState<Schedule>();
+  const remove = (schedule: Schedule) => setConfirmRemove(schedule);
+  const confirmDelete = async () => {
+    if (!confirmRemove) return;
     setBusy(true);
     try {
-      await api(`/api/instances/${instance.id}/schedules/${schedule.id}`, { method: "DELETE" });
-      if (editing?.id === schedule.id) reset();
+      await api(`/api/instances/${instance.id}/schedules/${confirmRemove.id}`, { method: "DELETE" });
+      if (editing?.id === confirmRemove.id) reset();
       notify("计划任务已删除");
       reload();
     } catch (error) {
-      notify(error instanceof Error ? error.message : "计划任务未删除");
+      notify(error instanceof Error ? error.message : "计划任务未删除", "error");
     } finally {
       setBusy(false);
     }
@@ -1971,6 +2043,15 @@ function ScheduleTool({
           </div>
         </div>
       )) : <p className="quiet">还没有计划任务。</p>}
+      {confirmRemove && (
+        <ConfirmDialog
+          title="删除计划任务"
+          body={`确定删除计划任务 “${confirmRemove.name}” 吗？该操作不可撤销。`}
+          confirmLabel="删除"
+          onConfirm={confirmDelete}
+          onCancel={() => setConfirmRemove(undefined)}
+        />
+      )}
     </div>
   );
 }
@@ -1987,7 +2068,7 @@ function ConfigurationTool({
   detail?: InstanceDetail;
   instance: Instance;
   node?: Node;
-  notify: (message?: string) => void;
+  notify: (message?: string, tone?: "success" | "error") => void;
   reload: () => void;
 }) {
   const [version, setVersion] = useState(instance.version);
@@ -2016,7 +2097,7 @@ function ConfigurationTool({
   const save = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!confirmed) {
-      notify("请先确认将重建运行容器");
+      notify("请先确认将重建运行容器", "error");
       return;
     }
     const nextEnvironment: Record<string, string> = {};
@@ -2024,11 +2105,11 @@ function ConfigurationTool({
       const key = entry.key.trim();
       if (!key) continue;
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
-        notify("环境变量名称只能包含字母、数字和下划线");
+        notify("环境变量名称只能包含字母、数字和下划线", "error");
         return;
       }
       if (key in nextEnvironment) {
-        notify("环境变量名称不能重复");
+        notify("环境变量名称不能重复", "error");
         return;
       }
       nextEnvironment[key] = entry.value;
@@ -2042,7 +2123,7 @@ function ConfigurationTool({
       notify("配置重建任务已提交，容器将在节点端重新创建");
       reload();
     } catch (error) {
-      notify(error instanceof Error ? error.message : "实例配置未保存");
+      notify(error instanceof Error ? error.message : "实例配置未保存", "error");
     } finally {
       setSaving(false);
     }
@@ -2129,7 +2210,7 @@ function MembersTool({
   notify,
 }: {
   instance: Instance;
-  notify: (message?: string) => void;
+  notify: (message?: string, tone?: "success" | "error") => void;
 }) {
   const [directory, setDirectory] = useState<MemberDirectory>();
   const [selectedUserId, setSelectedUserId] = useState("");
@@ -2144,7 +2225,7 @@ function MembersTool({
         await api<MemberDirectory>(`/api/instances/${instance.id}/members`),
       );
     } catch (error) {
-      notify(error instanceof Error ? error.message : "无法读取协作者");
+      notify(error instanceof Error ? error.message : "无法读取协作者", "error");
     }
   }, [instance.id, notify]);
 
@@ -2174,7 +2255,7 @@ function MembersTool({
       notify("协作者权限已保存");
       await load();
     } catch (error) {
-      notify(error instanceof Error ? error.message : "协作者未保存");
+      notify(error instanceof Error ? error.message : "协作者未保存", "error");
     } finally {
       setBusy(false);
     }
@@ -2182,7 +2263,8 @@ function MembersTool({
 
   const createAccount = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    const data = new FormData(event.currentTarget);
+    const form = event.currentTarget;
+    const data = new FormData(form);
     setBusy(true);
     try {
       const result = await api<{ user: User }>("/api/users", {
@@ -2193,12 +2275,12 @@ function MembersTool({
           role: "user",
         }),
       });
-      event.currentTarget.reset();
+      form.reset();
       await load();
       setSelectedUserId(result.user.id);
       notify("本地账号已创建");
     } catch (error) {
-      notify(error instanceof Error ? error.message : "账号未创建");
+      notify(error instanceof Error ? error.message : "账号未创建", "error");
     } finally {
       setBusy(false);
     }
@@ -2281,7 +2363,7 @@ function CollaboratorRow({
   member: MemberDirectory["members"][number];
   canManage: boolean;
   busy: boolean;
-  notify: (message?: string) => void;
+  notify: (message?: string, tone?: "success" | "error") => void;
   onSaved: () => Promise<void>;
 }) {
   const [permissions, setPermissions] = useState<Permission[]>(member.permissions);
@@ -2294,17 +2376,18 @@ function CollaboratorRow({
       await api(`/api/instances/${instanceId}/members/${member.userId}`, { method: "PUT", body: JSON.stringify({ permissions }) });
       notify("协作者权限已更新");
       await onSaved();
-    } catch (error) { notify(error instanceof Error ? error.message : "权限未更新"); }
+    } catch (error) { notify(error instanceof Error ? error.message : "权限未更新", "error"); }
     finally { setSaving(false); }
   };
-  const remove = async () => {
-    if (!window.confirm(`移除 ${member.user.username} 的实例权限？`)) return;
+  const [confirmRemove, setConfirmRemove] = useState(false);
+  const remove = () => setConfirmRemove(true);
+  const confirmDelete = async () => {
     setSaving(true);
     try {
       await api(`/api/instances/${instanceId}/members/${member.userId}`, { method: "DELETE" });
       notify("协作者已移除");
       await onSaved();
-    } catch (error) { notify(error instanceof Error ? error.message : "协作者未移除"); }
+    } catch (error) { notify(error instanceof Error ? error.message : "协作者未移除", "error"); }
     finally { setSaving(false); }
   };
   return <article className="member-row collaborator-row">
@@ -2312,6 +2395,15 @@ function CollaboratorRow({
     <span className="member-identity"><strong>{member.user.username}</strong><small>{member.user.role === "admin" ? "管理员账号" : "本地账号"}</small></span>
     <div className="member-permissions"><PermissionChecklist value={permissions} onChange={setPermissions} disabled={!canManage || saving || busy} /></div>
     {canManage && <div className="member-row-actions"><button className="icon-button" title="保存权限" disabled={saving || busy || !permissions.length} onClick={() => void save()}><Save size={15} /></button><button className="icon-button action-bad" title="移除协作者" disabled={saving || busy} onClick={() => void remove()}><Trash2 size={15} /></button></div>}
+    {confirmRemove && (
+      <ConfirmDialog
+        title="移除协作者"
+        body={`确定移除 ${member.user.username} 对该实例的全部权限吗？`}
+        confirmLabel="移除"
+        onConfirm={confirmDelete}
+        onCancel={() => setConfirmRemove(false)}
+      />
+    )}
   </article>;
 }
 
@@ -2334,10 +2426,24 @@ function NodeModal({
 }: {
   onClose: () => void;
   refresh: () => Promise<void>;
-  notify: (message?: string) => void;
+  notify: (message?: string, tone?: "success" | "error") => void;
 }) {
   const [token, setToken] = useState("");
   const [busy, setBusy] = useState(false);
+  const [revealed, setRevealed] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const copyTimer = useRef<number | undefined>(undefined);
+  useEffect(() => () => window.clearTimeout(copyTimer.current), []);
+  const copyToken = async () => {
+    try {
+      await navigator.clipboard.writeText(token);
+      setCopied(true);
+      window.clearTimeout(copyTimer.current);
+      copyTimer.current = window.setTimeout(() => setCopied(false), 2000);
+    } catch {
+      notify("复制失败，请手动选择令牌文本", "error");
+    }
+  };
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const data = new FormData(event.currentTarget);
@@ -2354,7 +2460,7 @@ function NodeModal({
       setToken(response.enrollmentToken);
       await refresh();
     } catch (error) {
-      notify(error instanceof Error ? error.message : "节点未创建");
+      notify(error instanceof Error ? error.message : "节点未创建", "error");
     } finally {
       setBusy(false);
     }
@@ -2364,14 +2470,20 @@ function NodeModal({
       {token ? (
         <div className="enrollment">
           <ShieldCheck size={28} />
-          <p>仅显示一次的注册令牌</p>
-          <code>{token}</code>
-          <button
-            className="button"
-            onClick={() => void navigator.clipboard.writeText(token)}
-          >
-            <Copy size={16} />
-            复制令牌
+          <p>仅显示一次的注册令牌，请妥善保存</p>
+          <div className="token-reveal">
+            <code>{revealed ? token : "••••••••••••••••••••••••••••••••"}</code>
+            <button
+              className="icon-button"
+              title={revealed ? "隐藏令牌" : "显示令牌"}
+              onClick={() => setRevealed((value) => !value)}
+            >
+              {revealed ? <EyeOff size={15} /> : <Eye size={15} />}
+            </button>
+          </div>
+          <button className="button" onClick={() => void copyToken()}>
+            {copied ? <Check size={16} /> : <Copy size={16} />}
+            {copied ? "已复制" : "复制令牌"}
           </button>
           <pre>{`CONTROLLER_URL=${location.origin}\nENROLLMENT_TOKEN=${token}`}</pre>
         </div>
@@ -2414,7 +2526,7 @@ function InstanceModal({
   nodes: Node[];
   onClose: () => void;
   refresh: () => Promise<void>;
-  notify: (message?: string) => void;
+  notify: (message?: string, tone?: "success" | "error") => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [kind, setKind] = useState("paper");
@@ -2456,7 +2568,7 @@ function InstanceModal({
       onClose();
       notify("实例创建任务已提交");
     } catch (error) {
-      notify(error instanceof Error ? error.message : "实例未创建");
+      notify(error instanceof Error ? error.message : "实例未创建", "error");
     } finally {
       setBusy(false);
     }
@@ -2592,6 +2704,60 @@ function Dialog({
           </button>
         </div>
         {children}
+      </section>
+    </div>
+  );
+}
+function ConfirmDialog({
+  title,
+  body,
+  confirmLabel,
+  onConfirm,
+  onCancel,
+}: {
+  title: string;
+  body: string;
+  confirmLabel: string;
+  onConfirm: () => void | Promise<void>;
+  onCancel: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const confirm = async () => {
+    setBusy(true);
+    try {
+      await onConfirm();
+    } finally {
+      setBusy(false);
+      onCancel();
+    }
+  };
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onCancel}>
+      <section
+        className="dialog confirm-dialog"
+        role="alertdialog"
+        aria-modal="true"
+        aria-label={title}
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <div className="confirm-icon">
+          <CircleAlert size={22} />
+        </div>
+        <h3>{title}</h3>
+        <p>{body}</p>
+        <div className="confirm-actions">
+          <button className="button" onClick={onCancel} disabled={busy}>
+            取消
+          </button>
+          <button
+            className="button danger"
+            onClick={() => void confirm()}
+            disabled={busy}
+          >
+            {busy && <LoaderCircle size={16} className="spin" />}
+            {confirmLabel}
+          </button>
+        </div>
       </section>
     </div>
   );
