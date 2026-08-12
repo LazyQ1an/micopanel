@@ -72,7 +72,7 @@ import type {
 import type { Permission } from "@micopanel/protocol";
 
 type Screen =
-  "overview" | "instances" | "nodes" | "tasks" | "backups" | "audit";
+  "overview" | "instances" | "nodes" | "tasks" | "backups" | "audit" | "users";
 type Modal = "node" | "instance" | null;
 type DetailTab = "console" | "metrics" | "config" | "files" | "backups" | "schedules" | "members";
 type Toast = { text: string; tone: "success" | "error" };
@@ -96,6 +96,7 @@ const nav: Array<{ id: Screen; label: string; icon: typeof LayoutDashboard }> =
     { id: "tasks", label: "任务", icon: Activity },
     { id: "backups", label: "备份", icon: DatabaseBackup },
     { id: "audit", label: "审计", icon: ScrollText },
+    { id: "users", label: "用户", icon: ShieldCheck },
   ];
 
 const statusText: Record<Instance["status"], string> = {
@@ -242,7 +243,7 @@ function AuthScreen({
               <CircleAlert size={16} /> {error}
             </p>
           )}
-          <button className="button primary full" disabled={busy}>
+          <button className="button primary full" type="submit" disabled={busy}>
             {busy ? (
               <LoaderCircle size={17} className="spin" />
             ) : (
@@ -416,6 +417,25 @@ function ControlPanel({
       notify(error instanceof Error ? error.message : "任务未能重新提交", "error");
     }
   };
+  const deleteNode = (node: Node) => {
+    setConfirm({
+      title: "删除节点",
+      body: `确定删除节点 “${node.name}” 吗？删除前需先归档或迁移该节点上的全部实例，此操作无法撤销。`,
+      confirmLabel: "删除节点",
+      run: async () => {
+        try {
+          await api(`/api/nodes/${node.id}`, { method: "DELETE" });
+          notify(`节点 ${node.name} 已删除`);
+          void refresh();
+        } catch (error) {
+          notify(
+            error instanceof Error ? error.message : "节点未删除",
+            "error",
+          );
+        }
+      },
+    });
+  };
   const signOut = async () => {
     await api("/api/auth/logout", { method: "POST" });
     await onSignOut();
@@ -445,7 +465,9 @@ function ControlPanel({
           </button>
         </div>
         <nav>
-          {nav.map(({ id, label, icon: Icon }) => (
+          {nav
+            .filter((item) => item.id !== "users" || user.role === "admin")
+            .map(({ id, label, icon: Icon }) => (
             <button
               key={id}
               className={`nav-item ${screen === id ? "active" : ""}`}
@@ -506,7 +528,7 @@ function ControlPanel({
               <i /> {dashboard?.summary.onlineNodes ?? 0}/
               {dashboard?.summary.totalNodes ?? 0} 节点在线
             </span>
-            {user.role === "admin" && (
+            {user.role === "admin" && screen !== "users" && (
               <button
                 className="button primary"
                 onClick={() =>
@@ -562,6 +584,7 @@ function ControlPanel({
                 onSelect={setSelectedNodeId}
                 canViewMetrics={user.role === "admin"}
                 onNew={() => setModal("node")}
+                onDelete={deleteNode}
               />
             )}
             {screen === "tasks" && (
@@ -575,6 +598,13 @@ function ControlPanel({
             )}
             {screen === "audit" && (
               <Audit events={audit} allow={user.role === "admin"} />
+            )}
+            {screen === "users" && (
+              <UsersScreen
+                currentUserId={user.id}
+                admin={user.role === "admin"}
+                notify={notify}
+              />
             )}
             {screen === "instances" && selected && (
               <InstanceWorkspace
@@ -966,7 +996,7 @@ function InstanceTable({
   );
 }
 
-function Nodes({ nodes, selectedId, onSelect, canViewMetrics, onNew }: { nodes: Node[]; selectedId?: string; onSelect: (id: string) => void; canViewMetrics: boolean; onNew: () => void }) {
+function Nodes({ nodes, selectedId, onSelect, canViewMetrics, onNew, onDelete }: { nodes: Node[]; selectedId?: string; onSelect: (id: string) => void; canViewMetrics: boolean; onNew: () => void; onDelete: (node: Node) => void }) {
   return (
     <section className="panel nodes-panel">
       <div className="panel-heading">
@@ -1002,6 +1032,16 @@ function Nodes({ nodes, selectedId, onSelect, canViewMetrics, onNew }: { nodes: 
                     onClick={() => onSelect(node.id)}
                   >
                     <Gauge size={16} />
+                  </button>
+                )}
+                {canViewMetrics && (
+                  <button
+                    className="icon-button node-delete-trigger"
+                    title="删除节点"
+                    aria-label={`删除 ${node.name} 节点`}
+                    onClick={() => onDelete(node)}
+                  >
+                    <Trash2 size={16} />
                   </button>
                 )}
               </div>
@@ -1222,6 +1262,302 @@ function Backups({
   );
 }
 
+
+function UsersScreen({
+  currentUserId,
+  admin,
+  notify,
+}: {
+  currentUserId: string;
+  admin: boolean;
+  notify: (message?: string, tone?: "success" | "error") => void;
+}) {
+  const [users, setUsers] = useState<User[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [resetFor, setResetFor] = useState<string>();
+  const [newPassword, setNewPassword] = useState("");
+  const [pending, setPending] = useState<User>();
+
+  const load = useCallback(async () => {
+    try {
+      setUsers((await api<{ users: User[] }>("/api/users")).users);
+    } catch (error) {
+      notify(
+        error instanceof Error ? error.message : "无法读取用户列表",
+        "error",
+      );
+    }
+  }, [notify]);
+
+  useEffect(() => {
+    if (admin) void load();
+  }, [admin, load]);
+
+  const lastAdmin = (user: User) =>
+    user.role === "admin" &&
+    users.filter((candidate) => candidate.role === "admin").length <= 1;
+
+  const create = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const data = new FormData(form);
+    setBusy(true);
+    try {
+      await api("/api/users", {
+        method: "POST",
+        body: JSON.stringify({
+          username: data.get("username"),
+          password: data.get("password"),
+          role: data.get("role"),
+        }),
+      });
+      form.reset();
+      await load();
+      notify("账号已创建");
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "账号未创建", "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const changeRole = async (user: User, role: "admin" | "user") => {
+    if (role === user.role) return;
+    if (role === "user" && lastAdmin(user)) {
+      notify("必须保留至少一名管理员", "error");
+      return;
+    }
+    setBusy(true);
+    try {
+      await api(`/api/users/${user.id}`, {
+        method: "PUT",
+        body: JSON.stringify({ role }),
+      });
+      await load();
+      notify(`${user.username} 的角色已更新`);
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "角色未更新", "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const resetPassword = async (user: User) => {
+    if (newPassword.length < 10) return;
+    setBusy(true);
+    try {
+      await api(`/api/users/${user.id}`, {
+        method: "PUT",
+        body: JSON.stringify({ password: newPassword }),
+      });
+      setResetFor(undefined);
+      setNewPassword("");
+      await load();
+      notify(`已重置 ${user.username} 的密码，其会话已全部注销`);
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "密码未重置", "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const remove = async (user: User) => {
+    setBusy(true);
+    try {
+      await api(`/api/users/${user.id}`, { method: "DELETE" });
+      setPending(undefined);
+      await load();
+      notify(`账号 ${user.username} 已删除`);
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "账号未删除", "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!admin)
+    return (
+      <section className="panel">
+        <Empty
+          icon={<ShieldCheck size={24} />}
+          title="用户管理仅向管理员开放"
+        />
+      </section>
+    );
+
+  return (
+    <section className="panel table-panel users-panel">
+      <div className="panel-heading table-heading">
+        <div>
+          <p className="eyebrow">Access control</p>
+          <h3>用户与角色</h3>
+        </div>
+        <button
+          className="icon-button"
+          title="刷新用户列表"
+          onClick={() => void load()}
+        >
+          <RotateCcw size={16} />
+        </button>
+      </div>
+      <form className="user-create-form" onSubmit={create}>
+        <span className="user-create-title">
+          <Plus size={15} /> 创建账号
+        </span>
+        <label>
+          用户名
+          <input
+            name="username"
+            minLength={3}
+            maxLength={32}
+            required
+            placeholder="builder"
+          />
+        </label>
+        <label>
+          初始密码
+          <input
+            name="password"
+            type="password"
+            minLength={10}
+            required
+            placeholder="至少 10 位"
+          />
+        </label>
+        <label>
+          角色
+          <select name="role" defaultValue="user">
+            <option value="user">普通用户</option>
+            <option value="admin">管理员</option>
+          </select>
+        </label>
+        <button className="button compact primary" type="submit" disabled={busy}>
+          {busy ? (
+            <LoaderCircle size={15} className="spin" />
+          ) : (
+            <Plus size={15} />
+          )}
+          创建
+        </button>
+      </form>
+      <div className="user-table">
+        <div className="table-row table-head user-row-head">
+          <span>账号</span>
+          <span>角色</span>
+          <span>创建时间</span>
+          <span>操作</span>
+        </div>
+        {users.map((user) => {
+          const self = user.id === currentUserId;
+          const protectedAdmin = lastAdmin(user);
+          return (
+            <div className="table-row user-row" key={user.id}>
+              <span className="user-identity">
+                <b>{user.username.slice(0, 1).toUpperCase()}</b>
+                <strong>
+                  {user.username}
+                  {self && <small>当前账号</small>}
+                </strong>
+              </span>
+              <span>
+                <select
+                  className="user-role-select"
+                  value={user.role}
+                  disabled={busy || self || protectedAdmin}
+                  title={
+                    self
+                      ? "不能修改当前登录账号的角色"
+                      : protectedAdmin
+                        ? "必须保留至少一名管理员"
+                        : "修改角色"
+                  }
+                  onChange={(event) =>
+                    void changeRole(
+                      user,
+                      event.target.value as "admin" | "user",
+                    )
+                  }
+                >
+                  <option value="admin">管理员</option>
+                  <option value="user">普通用户</option>
+                </select>
+              </span>
+              <span className="user-created">
+                <time>{formatTime(user.createdAt)}</time>
+              </span>
+              <span className="user-actions">
+                {resetFor === user.id ? (
+                  <>
+                    <input
+                      className="user-password-input"
+                      type="password"
+                      autoFocus
+                      minLength={10}
+                      placeholder="新密码，至少 10 位"
+                      value={newPassword}
+                      onChange={(event) => setNewPassword(event.target.value)}
+                    />
+                    <button
+                      className="button compact primary"
+                      disabled={busy || newPassword.length < 10}
+                      onClick={() => void resetPassword(user)}
+                    >
+                      确认
+                    </button>
+                    <button
+                      className="icon-button"
+                      title="取消重置"
+                      disabled={busy}
+                      onClick={() => {
+                        setResetFor(undefined);
+                        setNewPassword("");
+                      }}
+                    >
+                      <X size={15} />
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    className="icon-button"
+                    title={
+                      self ? "不能重置当前登录账号的密码" : "重置密码"
+                    }
+                    disabled={busy || self}
+                    onClick={() => {
+                      setResetFor(user.id);
+                      setNewPassword("");
+                    }}
+                  >
+                    <Pencil size={15} />
+                  </button>
+                )}
+                <button
+                  className="icon-button action-bad"
+                  title={self ? "不能删除当前登录账号" : "删除账号"}
+                  disabled={busy || self || protectedAdmin}
+                  onClick={() => setPending(user)}
+                >
+                  <Trash2 size={15} />
+                </button>
+              </span>
+            </div>
+          );
+        })}
+        {!users.length && <p className="quiet user-empty">暂无账号</p>}
+      </div>
+      {pending && (
+        <ConfirmDialog
+          title="删除账号"
+          body={`确定删除账号 “${pending.username}” 吗？该账号的全部会话将立即注销，且无法恢复。`}
+          confirmLabel="删除"
+          onConfirm={() => remove(pending)}
+          onCancel={() => setPending(undefined)}
+        />
+      )}
+    </section>
+  );
+}
+
 function Audit({
   events,
   allow,
@@ -1303,6 +1639,7 @@ function InstanceWorkspace({
   const [editor, setEditor] = useState<{ path: string; content: string }>();
   const [fileBusy, setFileBusy] = useState(false);
   const [transfer, setTransfer] = useState<FileTransfer>();
+  const [confirmArchive, setConfirmArchive] = useState(false);
   useEffect(() => {
     setTab("console");
     setDirectory("/");
@@ -1475,6 +1812,29 @@ function InstanceWorkspace({
       notify(error instanceof Error ? error.message : "备份任务未完成", "error");
     }
   };
+  const archived = instance.status === "archived";
+  const archiveInstance = async () => {
+    try {
+      const result = await api<{ recoverUntil: string }>(
+        `/api/instances/${instance.id}`,
+        { method: "DELETE" },
+      );
+      setConfirmArchive(false);
+      notify(`实例已归档，可在 ${formatTime(result.recoverUntil)} 前恢复`);
+      reload();
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "实例未归档", "error");
+    }
+  };
+  const restoreInstance = async () => {
+    try {
+      await api(`/api/instances/${instance.id}/restore`, { method: "POST" });
+      notify("实例恢复任务已提交");
+      reload();
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "实例未恢复", "error");
+    }
+  };
   return (
     <section className="instance-workspace">
       <div className="worktop">
@@ -1499,7 +1859,9 @@ function InstanceWorkspace({
             className="icon-button action-good"
             title="启动"
             disabled={
-              instance.status === "running" || instance.status === "starting"
+              archived ||
+              instance.status === "running" ||
+              instance.status === "starting"
             }
             onClick={() => void onAction(instance, "start")}
           >
@@ -1508,6 +1870,7 @@ function InstanceWorkspace({
           <button
             className="icon-button"
             title="重启"
+            disabled={archived}
             onClick={() => void onAction(instance, "restart")}
           >
             <RotateCcw size={17} />
@@ -1515,7 +1878,7 @@ function InstanceWorkspace({
           <button
             className="icon-button action-warn"
             title="停止"
-            disabled={instance.status === "offline"}
+            disabled={archived || instance.status === "offline"}
             onClick={() => void onAction(instance, "stop")}
           >
             <Pause size={17} />
@@ -1523,9 +1886,20 @@ function InstanceWorkspace({
           <button
             className="icon-button action-bad"
             title="强制停止"
+            disabled={archived}
             onClick={() => void onAction(instance, "kill")}
           >
             <Power size={17} />
+          </button>
+          <button
+            className={`icon-button ${archived ? "action-good" : "action-warn"}`}
+            title={archived ? "恢复实例" : "归档实例"}
+            onClick={() => {
+              if (archived) void restoreInstance();
+              else setConfirmArchive(true);
+            }}
+          >
+            <ArchiveRestore size={17} />
           </button>
         </div>
       </div>
@@ -1778,6 +2152,30 @@ function InstanceWorkspace({
             <p className="quiet">创建备份后可在此查看归档状态。</p>
           )}
         </div>
+      )}
+      {archived && (
+        <div className="archived-banner">
+          <ArchiveRestore size={16} />
+          <span>
+            实例已归档，数据保留至{" "}
+            {instance.archiveExpiresAt
+              ? formatTime(instance.archiveExpiresAt)
+              : "7 天"}
+            。恢复后即可重新分配并启动。
+          </span>
+          <button className="button compact primary" onClick={() => void restoreInstance()}>
+            立即恢复
+          </button>
+        </div>
+      )}
+      {confirmArchive && (
+        <ConfirmDialog
+          title="归档实例"
+          body={`确定归档实例 “${instance.name}” 吗？实例将停止并从节点移除，数据保留 7 天，期间可随时恢复。`}
+          confirmLabel="归档"
+          onConfirm={archiveInstance}
+          onCancel={() => setConfirmArchive(false)}
+        />
       )}
     </section>
   );
@@ -2196,7 +2594,7 @@ function ConfigurationTool({
             <input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />
             我确认保存后会重建运行容器
           </label>
-          <button className="button primary" disabled={saving || !confirmed}>
+          <button className="button primary" type="submit" disabled={saving || !confirmed}>
             {saving ? <LoaderCircle size={16} className="spin" /> : <Save size={16} />} 保存并重建
           </button>
         </div>
@@ -2508,7 +2906,7 @@ function NodeModal({
               <input name="end" type="number" defaultValue="25665" min="1025" />
             </label>
           </div>
-          <button className="button primary" disabled={busy}>
+          <button className="button primary" type="submit" disabled={busy}>
             {busy && <LoaderCircle size={16} className="spin" />}生成注册令牌
           </button>
         </form>
@@ -2669,7 +3067,7 @@ function InstanceModal({
             <input name="eula" type="checkbox" required />
             我已阅读并同意 Mojang EULA
           </label>
-          <button className="button primary" disabled={busy}>
+          <button className="button primary" type="submit" disabled={busy}>
             {busy && <LoaderCircle size={16} className="spin" />}创建实例
           </button>
         </form>

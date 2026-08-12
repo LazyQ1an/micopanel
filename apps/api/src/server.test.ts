@@ -320,3 +320,74 @@ test("control plane bootstraps, queues workloads, and archives safely", async ()
     await rm(testConfig.FILE_TRANSFERS_DIR, { recursive: true, force: true });
   }
 });
+
+test("admins manage users and nodes with safety guards", async () => {
+  const store = new MemoryStore();
+  const app = await buildServer({ config: testConfig, store });
+  try {
+    const bootstrap = await app.inject({ method: "POST", url: "/api/auth/bootstrap", ...json({ username: "root", password: "correct-password-123" }) });
+    assert.equal(bootstrap.statusCode, 200);
+    const adminCookie = String(bootstrap.headers["set-cookie"]).split(";")[0];
+    const adminId = bootstrap.json().user.id as string;
+
+    // create a regular user; non-admin cannot list users
+    const member = await app.inject({ method: "POST", url: "/api/users", headers: { cookie: adminCookie, "content-type": "application/json" }, payload: JSON.stringify({ username: "builder", password: "correct-builder-123" }) });
+    assert.equal(member.statusCode, 201);
+    const memberId = member.json().user.id as string;
+    const memberLogin = await app.inject({ method: "POST", url: "/api/auth/login", ...json({ username: "builder", password: "correct-builder-123" }) });
+    assert.equal(memberLogin.statusCode, 200);
+    const memberCookie = String(memberLogin.headers["set-cookie"]).split(";")[0];
+    assert.equal((await app.inject({ method: "GET", url: "/api/users", headers: { cookie: memberCookie } })).statusCode, 403);
+
+    const users = await app.inject({ method: "GET", url: "/api/users", headers: { cookie: adminCookie } });
+    assert.equal(users.statusCode, 200);
+    assert.equal(users.json().users.length, 2);
+
+    // cannot delete or demote the last admin
+    assert.equal((await app.inject({ method: "DELETE", url: `/api/users/${adminId}`, headers: { cookie: adminCookie } })).statusCode, 409);
+    assert.equal((await app.inject({ method: "PUT", url: `/api/users/${adminId}`, headers: { cookie: adminCookie, "content-type": "application/json" }, payload: JSON.stringify({ role: "user" }) })).statusCode, 409);
+
+    // promote member so they can own an instance
+    const promote = await app.inject({ method: "PUT", url: `/api/users/${memberId}`, headers: { cookie: adminCookie, "content-type": "application/json" }, payload: JSON.stringify({ role: "admin" }) });
+    assert.equal(promote.statusCode, 200);
+    assert.equal(promote.json().user.role, "admin");
+
+    const nodeForDelete = await app.inject({ method: "POST", url: "/api/nodes", headers: { cookie: adminCookie, "content-type": "application/json" }, payload: JSON.stringify({ name: "node-del", portRangeStart: 25700, portRangeEnd: 25701 }) });
+    assert.equal(nodeForDelete.statusCode, 201);
+    const ownedInstance = await app.inject({ method: "POST", url: "/api/instances", headers: { cookie: memberCookie, "content-type": "application/json" }, payload: JSON.stringify({ name: "owned", nodeId: nodeForDelete.json().node.id, kind: "paper", version: "1.21.4", memoryMb: 1024, cpuCores: 1, diskMb: 2048, pids: 128, eulaAccepted: true }) });
+    assert.equal(ownedInstance.statusCode, 202);
+
+    // user owning instances cannot be deleted; node hosting instances cannot be deleted
+    assert.equal((await app.inject({ method: "DELETE", url: `/api/users/${memberId}`, headers: { cookie: adminCookie } })).statusCode, 409);
+    assert.equal((await app.inject({ method: "DELETE", url: `/api/nodes/${nodeForDelete.json().node.id}`, headers: { cookie: adminCookie } })).statusCode, 409);
+
+    // demote back is allowed now that two admins exist; reset password revokes sessions
+    assert.equal((await app.inject({ method: "PUT", url: `/api/users/${memberId}`, headers: { cookie: adminCookie, "content-type": "application/json" }, payload: JSON.stringify({ role: "user" }) })).statusCode, 200);
+    const reset = await app.inject({ method: "PUT", url: `/api/users/${memberId}`, headers: { cookie: adminCookie, "content-type": "application/json" }, payload: JSON.stringify({ password: "fresh-password-456" }) });
+    assert.equal(reset.statusCode, 200);
+    assert.equal((await app.inject({ method: "POST", url: "/api/auth/login", ...json({ username: "builder", password: "correct-builder-123" }) })).statusCode, 401);
+    const newLogin = await app.inject({ method: "POST", url: "/api/auth/login", ...json({ username: "builder", password: "fresh-password-456" }) });
+    assert.equal(newLogin.statusCode, 200);
+    const memberCookie2 = String(newLogin.headers["set-cookie"]).split(";")[0];
+
+    // archive instance, then delete user and node
+    const archive = await app.inject({ method: "DELETE", url: `/api/instances/${ownedInstance.json().instance.id}`, headers: { cookie: memberCookie2 } });
+    assert.equal(archive.statusCode, 202);
+    assert.equal((await app.inject({ method: "DELETE", url: `/api/users/${memberId}`, headers: { cookie: adminCookie } })).statusCode, 204);
+    assert.equal((await app.inject({ method: "GET", url: "/api/users", headers: { cookie: adminCookie } })).json().users.length, 1);
+    const emptyNode = await app.inject({ method: "POST", url: "/api/nodes", headers: { cookie: adminCookie, "content-type": "application/json" }, payload: JSON.stringify({ name: "node-empty", portRangeStart: 25710, portRangeEnd: 25711 }) });
+    assert.equal((await app.inject({ method: "DELETE", url: `/api/nodes/${emptyNode.json().node.id}`, headers: { cookie: adminCookie } })).statusCode, 204);
+    assert.equal((await app.inject({ method: "GET", url: "/api/nodes", headers: { cookie: adminCookie } })).json().nodes.length, 1);
+
+    const audits = (await app.inject({ method: "GET", url: "/api/audit", headers: { cookie: adminCookie } })).json().audits as Array<{ action: string }>;
+    assert.equal(audits.some((audit) => audit.action === "user.role.updated"), true);
+    assert.equal(audits.some((audit) => audit.action === "user.password_reset"), true);
+    assert.equal(audits.some((audit) => audit.action === "user.deleted"), true);
+    assert.equal(audits.some((audit) => audit.action === "node.deleted"), true);
+  } finally {
+    await app.close();
+    await rm(testConfig.ARTIFACTS_DIR, { recursive: true, force: true });
+    await rm(testConfig.FILE_TRANSFERS_DIR, { recursive: true, force: true });
+  }
+});
+

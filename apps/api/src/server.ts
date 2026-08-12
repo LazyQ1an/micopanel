@@ -149,6 +149,10 @@ const scheduleSchema = z.object({ name: z.string().min(2).max(64), cron: z.strin
 const scheduleUpdateSchema = z.object({ name: z.string().min(2).max(64), cron: z.string().min(9).max(128), enabled: z.boolean() }).and(scheduleActionSchema);
 const memberSchema = z.object({ permissions: z.array(z.enum(ALL_INSTANCE_PERMISSIONS)).min(1) });
 const userSchema = z.object({ username: z.string().min(3).max(32), password: z.string().min(10).max(128), role: z.enum(["admin", "user"]).default("user") });
+const userUpdateSchema = z.object({
+  role: z.enum(["admin", "user"]).optional(),
+  password: z.string().min(10).max(128).optional()
+}).refine((value) => value.role !== undefined || value.password !== undefined, "没有需要更新的内容");
 const environmentSchema = z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).max(128), z.string().max(4096))
   .refine((environment) => Object.keys(environment).length <= 64, "环境变量数量不能超过 64 个")
   .refine((environment) => Object.keys(environment).every((key) => !MANAGED_ENVIRONMENT_KEYS.has(key)), "不能修改受管环境变量");
@@ -687,6 +691,54 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
     return reply.code(201).send({ user: userPublic(user) });
   });
 
+  app.put("/api/users/:userId", async (request, reply) => {
+    const actor = await getCurrentUser(request);
+    if (!actor) return unauthenticated(reply);
+    if (!isAdmin(actor)) return forbidden(reply);
+    const userId = (request.params as { userId: string }).userId;
+    const input = userUpdateSchema.parse(request.body);
+    const updated = await store.transaction(async (state) => {
+      const target = state.users.find((candidate) => candidate.id === userId);
+      if (!target) throw new Error("用户不存在");
+      if (input.role && input.role !== target.role) {
+        if (input.role === "user" && isAdmin(target) && state.users.filter((candidate) => isAdmin(candidate)).length <= 1) {
+          throw new Error("不能取消最后一个管理员的管理权限");
+        }
+        target.role = input.role;
+        addAudit(state, actor.id, "user.role.updated", target.id, `角色变更为 ${input.role}`);
+      }
+      if (input.password) {
+        target.passwordHash = await hashPassword(input.password);
+        state.sessions = state.sessions.filter((session) => session.userId !== target.id);
+        addAudit(state, actor.id, "user.password_reset", target.id, "密码已由管理员重置，会话已注销");
+      }
+      return target;
+    });
+    return reply.send({ user: userPublic(updated) });
+  });
+
+  app.delete("/api/users/:userId", async (request, reply) => {
+    const actor = await getCurrentUser(request);
+    if (!actor) return unauthenticated(reply);
+    if (!isAdmin(actor)) return forbidden(reply);
+    const userId = (request.params as { userId: string }).userId;
+    if (userId === actor.id) return reply.code(409).send({ error: "不能删除当前登录的账号" });
+    await store.transaction(async (state) => {
+      const target = state.users.find((candidate) => candidate.id === userId);
+      if (!target) throw new Error("用户不存在");
+      if (isAdmin(target) && state.users.filter((candidate) => isAdmin(candidate)).length <= 1) {
+        throw new Error("不能删除最后一个管理员");
+      }
+      const owned = state.instances.filter((instance) => instance.ownerId === userId && instance.status !== "archived").length;
+      if (owned > 0) throw new Error(`该用户仍拥有 ${owned} 个实例，请先转移或归档`);
+      state.users = state.users.filter((candidate) => candidate.id !== userId);
+      state.sessions = state.sessions.filter((session) => session.userId !== userId);
+      state.members = state.members.filter((member) => member.userId !== userId);
+      addAudit(state, actor.id, "user.deleted", userId, target.username);
+    });
+    return reply.code(204).send();
+  });
+
   app.get("/api/nodes", async (request, reply) => {
     const user = await getCurrentUser(request);
     if (!user) return unauthenticated(reply);
@@ -712,6 +764,22 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
     const input = nodeSchema.parse(request.body);
     const result = await createNode(store, user.id, input);
     return reply.code(201).send({ node: nodePublic(result.node), enrollmentToken: result.enrollmentToken });
+  });
+
+  app.delete("/api/nodes/:nodeId", async (request, reply) => {
+    const user = await getCurrentUser(request);
+    if (!user) return unauthenticated(reply);
+    if (!isAdmin(user)) return forbidden(reply);
+    const nodeId = (request.params as { nodeId: string }).nodeId;
+    await store.transaction(async (state) => {
+      const target = state.nodes.find((candidate) => candidate.id === nodeId);
+      if (!target) throw new Error("节点不存在");
+      const hosted = state.instances.filter((instance) => instance.nodeId === nodeId && instance.status !== "archived").length;
+      if (hosted > 0) throw new Error(`该节点仍承载 ${hosted} 个实例，请先迁移或归档`);
+      state.nodes = state.nodes.filter((candidate) => candidate.id !== nodeId);
+      addAudit(state, user.id, "node.deleted", nodeId, target.name);
+    });
+    return reply.code(204).send();
   });
 
   app.get("/api/artifacts", async (request, reply) => {
@@ -1358,8 +1426,8 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
     const message = error instanceof Error ? error.message : "未知错误";
     const statusCode = (error as { statusCode?: unknown }).statusCode;
     if (typeof statusCode === "number" && statusCode >= 400 && statusCode < 500) return reply.code(statusCode).send({ error: message });
-    if (message === "节点不存在" || message === "协作者不存在") return reply.code(404).send({ error: message });
-    if (message.includes("端口") || message.includes("同名") || message.includes("已存在")) return reply.code(409).send({ error: message });
+    if (message === "节点不存在" || message === "协作者不存在" || message === "用户不存在") return reply.code(404).send({ error: message });
+    if (message.includes("端口") || message.includes("同名") || message.includes("已存在") || message.includes("管理员") || message.includes("账号") || message.includes("实例")) return reply.code(409).send({ error: message });
     app.log.error(error);
     return reply.code(500).send({ error: "服务器处理请求时出现错误" });
   });
