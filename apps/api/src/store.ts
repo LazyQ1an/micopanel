@@ -98,10 +98,14 @@ export class PostgresStateStore implements StateStore {
         memory_limit_bytes BIGINT NOT NULL,
         network_rx_bytes BIGINT NOT NULL,
         network_tx_bytes BIGINT NOT NULL,
+        disk_bytes BIGINT,
+        disk_limit_bytes BIGINT,
         pids INTEGER,
         PRIMARY KEY (scope, entity_id, captured_at)
       )
     `);
+    await this.pool.query("ALTER TABLE metric_points ADD COLUMN IF NOT EXISTS disk_bytes BIGINT");
+    await this.pool.query("ALTER TABLE metric_points ADD COLUMN IF NOT EXISTS disk_limit_bytes BIGINT");
     await this.pool.query("CREATE INDEX IF NOT EXISTS metric_points_entity_time_idx ON metric_points (scope, entity_id, captured_at DESC)");
     const result = await this.pool.query<{ state: PanelState }>("SELECT state FROM panel_state WHERE id = 1");
     if (result.rowCount) {
@@ -138,12 +142,12 @@ export class PostgresStateStore implements StateStore {
     if (!rows.length) return;
     const values: unknown[] = [];
     const rowsSql = rows.map((row, index) => {
-      const offset = index * 9;
-      values.push(row.scope, row.entityId, row.point.capturedAt, row.point.cpuPercent, row.point.memoryBytes, row.point.memoryLimitBytes, row.point.networkRxBytes, row.point.networkTxBytes, row.point.pids ?? null);
-      return `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8}, $${offset + 9})`;
+      const offset = index * 11;
+      values.push(row.scope, row.entityId, row.point.capturedAt, row.point.cpuPercent, row.point.memoryBytes, row.point.memoryLimitBytes, row.point.networkRxBytes, row.point.networkTxBytes, row.point.diskBytes ?? null, row.point.diskLimitBytes ?? null, row.point.pids ?? null);
+      return `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8}, $${offset + 9}, $${offset + 10}, $${offset + 11})`;
     });
     await this.pool.query(`
-      INSERT INTO metric_points (scope, entity_id, captured_at, cpu_percent, memory_bytes, memory_limit_bytes, network_rx_bytes, network_tx_bytes, pids)
+      INSERT INTO metric_points (scope, entity_id, captured_at, cpu_percent, memory_bytes, memory_limit_bytes, network_rx_bytes, network_tx_bytes, disk_bytes, disk_limit_bytes, pids)
       VALUES ${rowsSql.join(", ")}
       ON CONFLICT (scope, entity_id, captured_at) DO UPDATE SET
         cpu_percent = EXCLUDED.cpu_percent,
@@ -151,6 +155,8 @@ export class PostgresStateStore implements StateStore {
         memory_limit_bytes = EXCLUDED.memory_limit_bytes,
         network_rx_bytes = EXCLUDED.network_rx_bytes,
         network_tx_bytes = EXCLUDED.network_tx_bytes,
+        disk_bytes = EXCLUDED.disk_bytes,
+        disk_limit_bytes = EXCLUDED.disk_limit_bytes,
         pids = EXCLUDED.pids
     `, values);
     if (Date.now() - this.lastMetricPruneAt >= 5 * 60 * 1000) {
@@ -166,9 +172,11 @@ export class PostgresStateStore implements StateStore {
       memory_limit_bytes: string | number;
       network_rx_bytes: string | number;
       network_tx_bytes: string | number;
+      disk_bytes: string | number | null;
+      disk_limit_bytes: string | number | null;
       pids: number | null;
     }>(`
-      SELECT captured_at, cpu_percent, memory_bytes, memory_limit_bytes, network_rx_bytes, network_tx_bytes, pids
+      SELECT captured_at, cpu_percent, memory_bytes, memory_limit_bytes, network_rx_bytes, network_tx_bytes, disk_bytes, disk_limit_bytes, pids
       FROM metric_points
       WHERE scope = $1 AND entity_id = $2 AND captured_at >= $3
       ORDER BY captured_at ASC
@@ -181,6 +189,8 @@ export class PostgresStateStore implements StateStore {
       memoryLimitBytes: Number(row.memory_limit_bytes),
       networkRxBytes: Number(row.network_rx_bytes),
       networkTxBytes: Number(row.network_tx_bytes),
+      diskBytes: row.disk_bytes === null ? undefined : Number(row.disk_bytes),
+      diskLimitBytes: row.disk_limit_bytes === null ? undefined : Number(row.disk_limit_bytes),
       pids: row.pids ?? undefined
     }));
   }

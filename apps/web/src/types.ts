@@ -78,6 +78,8 @@ export interface MetricPoint {
   memoryLimitBytes: number;
   networkRxBytes: number;
   networkTxBytes: number;
+  diskBytes?: number;
+  diskLimitBytes?: number;
   pids?: number;
 }
 

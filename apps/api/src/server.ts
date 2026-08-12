@@ -66,13 +66,15 @@ const sessionLifetimeMs = 1000 * 60 * 60 * 24 * 14;
 const archiveRetentionMs = 1000 * 60 * 60 * 24 * 7;
 const now = (): string => new Date().toISOString();
 const transferPublic = ({ tokenHash: _tokenHash, ...transfer }: FileTransferRecord) => transfer;
-const metricPoint = (usage: { cpuPercent: number; memoryBytes: number; memoryLimitBytes: number; networkRxBytes: number; networkTxBytes: number }, capturedAt: string, pids?: number): MetricPoint => ({
+const metricPoint = (usage: { cpuPercent: number; memoryBytes: number; memoryLimitBytes: number; networkRxBytes: number; networkTxBytes: number; diskBytes?: number; diskLimitBytes?: number }, capturedAt: string, pids?: number): MetricPoint => ({
   capturedAt,
   cpuPercent: Number.isFinite(usage.cpuPercent) ? Math.max(0, usage.cpuPercent) : 0,
   memoryBytes: Number.isFinite(usage.memoryBytes) ? Math.max(0, usage.memoryBytes) : 0,
   memoryLimitBytes: Number.isFinite(usage.memoryLimitBytes) ? Math.max(0, usage.memoryLimitBytes) : 0,
   networkRxBytes: Number.isFinite(usage.networkRxBytes) ? Math.max(0, usage.networkRxBytes) : 0,
   networkTxBytes: Number.isFinite(usage.networkTxBytes) ? Math.max(0, usage.networkTxBytes) : 0,
+  diskBytes: typeof usage.diskBytes === "number" && Number.isFinite(usage.diskBytes) ? Math.max(0, usage.diskBytes) : undefined,
+  diskLimitBytes: typeof usage.diskLimitBytes === "number" && Number.isFinite(usage.diskLimitBytes) ? Math.max(0, usage.diskLimitBytes) : undefined,
   pids: typeof pids === "number" && Number.isFinite(pids) ? Math.max(0, Math.floor(pids)) : undefined
 });
 

@@ -263,6 +263,7 @@ function ControlPanel({
   const [panelOpen, setPanelOpen] = useState(false);
   const [dashboard, setDashboard] = useState<Dashboard>();
   const [selectedId, setSelectedId] = useState<string>();
+  const [selectedNodeId, setSelectedNodeId] = useState<string>();
   const [detail, setDetail] = useState<InstanceDetail>();
   const [modal, setModal] = useState<Modal>(null);
   const [message, setMessage] = useState<string>();
@@ -284,6 +285,11 @@ function ControlPanel({
         current && next.instances.some((instance) => instance.id === current)
           ? current
           : next.instances[0]?.id,
+      );
+      setSelectedNodeId((current) =>
+        current && next.nodes.some((node) => node.id === current)
+          ? current
+          : next.nodes[0]?.id,
       );
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "无法刷新控制面");
@@ -499,7 +505,13 @@ function ControlPanel({
               />
             )}
             {screen === "nodes" && (
-              <Nodes nodes={dashboard.nodes} onNew={() => setModal("node")} />
+              <Nodes
+                nodes={dashboard.nodes}
+                selectedId={selectedNodeId}
+                onSelect={setSelectedNodeId}
+                canViewMetrics={user.role === "admin"}
+                onNew={() => setModal("node")}
+              />
             )}
             {screen === "tasks" && (
               <Tasks tasks={dashboard.tasks} instances={dashboard.instances} onRetry={retryTask} />
@@ -885,7 +897,7 @@ function InstanceTable({
   );
 }
 
-function Nodes({ nodes, onNew }: { nodes: Node[]; onNew: () => void }) {
+function Nodes({ nodes, selectedId, onSelect, canViewMetrics, onNew }: { nodes: Node[]; selectedId?: string; onSelect: (id: string) => void; canViewMetrics: boolean; onNew: () => void }) {
   return (
     <section className="panel nodes-panel">
       <div className="panel-heading">
@@ -901,7 +913,7 @@ function Nodes({ nodes, onNew }: { nodes: Node[]; onNew: () => void }) {
       {nodes.length ? (
         <div className="node-list">
           {nodes.map((node) => (
-            <article className="node-card" key={node.id}>
+            <article className={`node-card ${selectedId === node.id ? "selected" : ""}`} key={node.id}>
               <div className="node-card-top">
                 <span className={`dot large ${node.online ? "online" : ""}`} />
                 <div>
@@ -912,6 +924,17 @@ function Nodes({ nodes, onNew }: { nodes: Node[]; onNew: () => void }) {
                   value={node.online ? "在线" : "离线"}
                   status={node.online ? "running" : "offline"}
                 />
+                {canViewMetrics && (
+                  <button
+                    className="icon-button node-health-trigger"
+                    title="查看节点健康趋势"
+                    aria-label={`查看 ${node.name} 节点健康趋势`}
+                    aria-pressed={selectedId === node.id}
+                    onClick={() => onSelect(node.id)}
+                  >
+                    <Gauge size={16} />
+                  </button>
+                )}
               </div>
               <div className="node-stats">
                 <span>
@@ -945,7 +968,76 @@ function Nodes({ nodes, onNew }: { nodes: Node[]; onNew: () => void }) {
           onAction={onNew}
         />
       )}
+      {canViewMetrics && selectedId && nodes.some((node) => node.id === selectedId) && (
+        <NodeHealth node={nodes.find((node) => node.id === selectedId)!} />
+      )}
     </section>
+  );
+}
+
+function NodeHealth({ node }: { node: Node }) {
+  const [minutes, setMinutes] = useState(60);
+  const [points, setPoints] = useState<MetricPoint[]>([]);
+  const [error, setError] = useState<string>();
+
+  useEffect(() => {
+    let active = true;
+    const load = async () => {
+      try {
+        const result = await api<{ metrics: MetricPoint[] }>(`/api/nodes/${node.id}/metrics?minutes=${minutes}`);
+        if (active) {
+          setPoints(result.metrics);
+          setError(undefined);
+        }
+      } catch (loadError) {
+        if (active) setError(loadError instanceof Error ? loadError.message : "节点健康数据暂时无法读取");
+      }
+    };
+    void load();
+    const timer = window.setInterval(() => void load(), 30_000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [node.id, minutes]);
+
+  const latest = points[points.length - 1];
+  const diskBytes = latest?.diskBytes ?? node.usage?.diskBytes;
+  const diskLimitBytes = latest?.diskLimitBytes ?? node.usage?.diskLimitBytes;
+  const diskPercent = diskBytes !== undefined && diskLimitBytes ? (diskBytes / diskLimitBytes) * 100 : 0;
+  const risk = diskPercent >= 90 ? "error" : diskPercent >= 75 ? "starting" : "running";
+  return (
+    <div className="node-health-tool">
+      <div className="node-health-head">
+        <div>
+          <span className="tool-kicker">NODE HEALTH</span>
+          <strong>{node.name} · 容量与趋势</strong>
+        </div>
+        <Status value={diskLimitBytes ? `磁盘 ${diskPercent.toFixed(0)}%` : "等待采样"} status={diskLimitBytes ? risk : "offline"} />
+      </div>
+      <div className="metrics-toolbar">
+        <span>时间范围</span>
+        {[15, 60, 360, 1440].map((range) => (
+          <button key={range} type="button" className={minutes === range ? "selected" : ""} onClick={() => setMinutes(range)}>
+            {range < 60 ? `${range} 分钟` : range === 60 ? "1 小时" : range === 360 ? "6 小时" : "24 小时"}
+          </button>
+        ))}
+      </div>
+      <div className="metrics-summary node-health-summary">
+        <MetricReadout label="CPU" value={latest ? `${latest.cpuPercent.toFixed(1)}%` : node.usage ? `${node.usage.cpuPercent.toFixed(1)}%` : "--"} />
+        <MetricReadout label="内存" value={latest ? `${formatBytes(latest.memoryBytes)} / ${formatBytes(latest.memoryLimitBytes)}` : node.usage ? `${formatBytes(node.usage.memoryBytes)} / ${formatBytes(node.usage.memoryLimitBytes)}` : "--"} />
+        <MetricReadout label="磁盘" value={diskBytes !== undefined ? `${formatBytes(diskBytes)} / ${formatBytes(diskLimitBytes)}` : "--"} />
+        <MetricReadout label="网络 RX / TX" value={latest ? `${formatBytes(latest.networkRxBytes)} / ${formatBytes(latest.networkTxBytes)}` : "--"} />
+      </div>
+      {error ? <p className="metric-error">{error}</p> : null}
+      <div className="metric-charts node-health-charts">
+        <MetricChart title="CPU 使用率" points={points.map((point) => point.cpuPercent)} suffix="%" color="#56d59b" max={100} />
+        <MetricChart title="内存占用" points={points.map((point) => point.memoryBytes)} suffix="" color="#e4b45b" max={Math.max(1, ...points.map((point) => point.memoryLimitBytes))} format={formatBytes} />
+        <MetricChart title="磁盘占用" points={points.map((point) => point.diskBytes ?? 0)} suffix="" color="#c780d9" max={Math.max(1, ...points.map((point) => point.diskLimitBytes ?? 0))} format={formatBytes} />
+        <MetricChart title="网络 RX" points={points.map((point) => point.networkRxBytes)} suffix="" color="#7bb7e8" max={Math.max(1, ...points.map((point) => point.networkRxBytes))} format={formatBytes} />
+      </div>
+      {!points.length && !error ? <p className="metric-empty">节点在线并上报后，会在这里显示容量趋势。</p> : null}
+    </div>
   );
 }
 
