@@ -475,3 +475,51 @@ test("two-factor authentication protects login and password changes", async () =
     await rm(testConfig.FILE_TRANSFERS_DIR, { recursive: true, force: true });
   }
 });
+
+test("personal API tokens authenticate requests and revoke cleanly", async () => {
+  const store = new MemoryStore();
+  const app = await buildServer({ config: testConfig, store });
+  try {
+    const bootstrap = await app.inject({ method: "POST", url: "/api/auth/bootstrap", ...json({ username: "root", password: "correct-password-123" }) });
+    assert.equal(bootstrap.statusCode, 200);
+    const cookie = String(bootstrap.headers["set-cookie"]).split(";")[0];
+
+    // creating a token returns the plaintext once
+    const created = await app.inject({ method: "POST", url: "/api/tokens", headers: { cookie, "content-type": "application/json" }, payload: JSON.stringify({ name: "ci-deploy" }) });
+    assert.equal(created.statusCode, 201);
+    const { token } = created.json() as { token: string };
+    assert.match(token, /^mcp_/);
+
+    // the token authenticates like a session
+    const dashboard = await app.inject({ method: "GET", url: "/api/dashboard", headers: { authorization: `Bearer ${token}` } });
+    assert.equal(dashboard.statusCode, 200);
+
+    // listing never exposes the stored hash
+    const list = await app.inject({ method: "GET", url: "/api/tokens", headers: { cookie } });
+    assert.equal(list.statusCode, 200);
+    const tokens = (list.json() as { apiTokens: Array<{ id: string; name: string; tokenHash?: string }> }).apiTokens;
+    assert.equal(tokens.length, 1);
+    assert.equal(tokens[0].name, "ci-deploy");
+    assert.equal(tokens[0].tokenHash, undefined);
+
+    // forged tokens are rejected
+    const forged = await app.inject({ method: "GET", url: "/api/dashboard", headers: { authorization: "Bearer mcp_forged-token-value-123" } });
+    assert.equal(forged.statusCode, 401);
+
+    // revoking the token invalidates it immediately
+    const revoked = await app.inject({ method: "DELETE", url: `/api/tokens/${tokens[0].id}`, headers: { cookie } });
+    assert.equal(revoked.statusCode, 204);
+    const after = await app.inject({ method: "GET", url: "/api/dashboard", headers: { authorization: `Bearer ${token}` } });
+    assert.equal(after.statusCode, 401);
+
+    // the whole lifecycle is recorded in the audit trail
+    const audits = (await app.inject({ method: "GET", url: "/api/audit", headers: { cookie } })).json().audits as Array<{ action: string }>;
+    for (const action of ["token.created", "token.revoked"]) {
+      assert.equal(audits.some((audit) => audit.action === action), true, `expected audit ${action}`);
+    }
+  } finally {
+    await app.close();
+    await rm(testConfig.ARTIFACTS_DIR, { recursive: true, force: true });
+    await rm(testConfig.FILE_TRANSFERS_DIR, { recursive: true, force: true });
+  }
+});

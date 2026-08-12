@@ -8,6 +8,13 @@ export interface User {
   twoFactorEnabled?: boolean;
 }
 
+export interface ApiToken {
+  id: string;
+  name: string;
+  createdAt: string;
+  lastUsedAt?: string;
+}
+
 export interface Node {
   id: string;
   name: string;

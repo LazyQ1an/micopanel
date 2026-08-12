@@ -150,9 +150,19 @@ export interface FileTransferRecord {
   error?: string;
 }
 
+export interface ApiTokenRecord {
+  id: string;
+  userId: string;
+  name: string;
+  tokenHash: string;
+  createdAt: string;
+  lastUsedAt?: string;
+}
+
 export interface PanelState {
   users: User[];
   sessions: Session[];
+  apiTokens: ApiTokenRecord[];
   nodes: NodeRecord[];
   instances: InstanceRecord[];
   members: InstanceMember[];
@@ -167,6 +177,7 @@ export interface PanelState {
 export const createEmptyState = (): PanelState => ({
   users: [],
   sessions: [],
+  apiTokens: [],
   nodes: [],
   instances: [],
   members: [],

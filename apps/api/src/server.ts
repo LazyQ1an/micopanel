@@ -52,7 +52,7 @@ import {
 } from "./service.js";
 import { createStore, type StateStore } from "./store.js";
 import { SERVER_TEMPLATES } from "./templates.js";
-import type { ArtifactRecord, BackupRecord, FileTransferRecord, InstanceRecord, ManagedFile, MetricPoint, NodeRecord, ScheduleRecord, TaskRecord, User } from "./types.js";
+import type { ApiTokenRecord, ArtifactRecord, BackupRecord, FileTransferRecord, InstanceRecord, ManagedFile, MetricPoint, NodeRecord, ScheduleRecord, TaskRecord, User } from "./types.js";
 
 type SocketLike = {
   readyState: number;
@@ -110,6 +110,8 @@ class RealtimeHub {
   }
 }
 
+const bearerTokenPrefix = "mcp_";
+const tokenPublic = (record: ApiTokenRecord) => ({ id: record.id, name: record.name, createdAt: record.createdAt, lastUsedAt: record.lastUsedAt });
 const userPublic = (user: User) => ({ id: user.id, username: user.username, role: user.role, createdAt: user.createdAt, twoFactorEnabled: Boolean(user.totpEnabled) });
 const unauthenticated = (reply: FastifyReply) => reply.code(401).send({ error: "需要登录后才能继续" });
 const forbidden = (reply: FastifyReply) => reply.code(403).send({ error: "没有执行此操作的权限" });
@@ -205,6 +207,20 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
   });
 
   const getCurrentUser = async (request: FastifyRequest): Promise<User | undefined> => {
+    const auth = request.headers.authorization;
+    if (auth?.startsWith("Bearer ")) {
+      const token = auth.slice("Bearer ".length).trim();
+      if (!token.startsWith(bearerTokenPrefix)) return undefined;
+      const tokenHash = hashToken(token);
+      const state = await store.read();
+      const record = state.apiTokens.find((candidate) => candidate.tokenHash === tokenHash);
+      if (!record) return undefined;
+      void store.transaction((draft) => {
+        const target = draft.apiTokens.find((candidate) => candidate.id === record.id);
+        if (target) target.lastUsedAt = now();
+      });
+      return findUser(state, record.userId);
+    }
     const signed = request.cookies[sessionCookie];
     if (!signed) return undefined;
     const result = request.unsignCookie(signed);
@@ -733,6 +749,49 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
       target.recoveryCodes = undefined;
       addAudit(draft, user.id, "auth.2fa.disabled", user.id, "两步验证已关闭");
     });
+    return reply.code(204).send();
+  });
+
+  const apiTokenSchema = z.object({ name: z.string().min(1).max(64) });
+
+  app.post("/api/tokens", async (request, reply) => {
+    const user = await getCurrentUser(request);
+    if (!user) return unauthenticated(reply);
+    const input = apiTokenSchema.parse(request.body);
+    const token = `${bearerTokenPrefix}${randomToken(32)}`;
+    const record: ApiTokenRecord = {
+      id: id(),
+      userId: user.id,
+      name: input.name,
+      tokenHash: hashToken(token),
+      createdAt: now()
+    };
+    await store.transaction((state) => {
+      state.apiTokens.unshift(record);
+      addAudit(state, user.id, "token.created", record.id, input.name);
+    });
+    return reply.code(201).send({ token, apiToken: tokenPublic(record) });
+  });
+
+  app.get("/api/tokens", async (request, reply) => {
+    const user = await getCurrentUser(request);
+    if (!user) return unauthenticated(reply);
+    const state = await store.read();
+    return { apiTokens: state.apiTokens.filter((record) => record.userId === user.id).map(tokenPublic) };
+  });
+
+  app.delete("/api/tokens/:tokenId", async (request, reply) => {
+    const user = await getCurrentUser(request);
+    if (!user) return unauthenticated(reply);
+    const tokenId = (request.params as { tokenId: string }).tokenId;
+    const removed = await store.transaction((state) => {
+      const index = state.apiTokens.findIndex((record) => record.id === tokenId && record.userId === user.id);
+      if (index < 0) return false;
+      const [record] = state.apiTokens.splice(index, 1);
+      addAudit(state, user.id, "token.revoked", record.id, record.name);
+      return true;
+    });
+    if (!removed) return notFound(reply, "令牌不存在");
     return reply.code(204).send();
   });
 

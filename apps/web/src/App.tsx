@@ -21,6 +21,7 @@ import {
   FolderTree,
   Gauge,
   HardDrive,
+  KeyRound,
   LayoutDashboard,
   LoaderCircle,
   LogOut,
@@ -57,6 +58,7 @@ import {
 } from "react";
 import { api, ApiError, formatBytes, formatTime } from "./api";
 import type {
+  ApiToken,
   Backup,
   Dashboard,
   FileTransfer,
@@ -70,6 +72,29 @@ import type {
   User,
 } from "./types";
 import type { Permission } from "@micopanel/protocol";
+
+
+function useAnimatedNumber(value: number, duration = 550): number {
+  const [display, setDisplay] = useState(value);
+  const previous = useRef(value);
+  useEffect(() => {
+    const from = previous.current;
+    const to = value;
+    if (from === to) return;
+    previous.current = value;
+    let frame = 0;
+    const start = performance.now();
+    const tick = (now: number) => {
+      const progress = Math.min(1, (now - start) / duration);
+      const eased = 1 - Math.pow(1 - progress, 3);
+      setDisplay(Math.round(from + (to - from) * eased));
+      if (progress < 1) frame = requestAnimationFrame(tick);
+    };
+    frame = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(frame);
+  }, [duration, value]);
+  return display;
+}
 
 type Screen =
   "overview" | "instances" | "nodes" | "tasks" | "backups" | "audit" | "users";
@@ -831,6 +856,7 @@ function Overview({
         <Metric
           label="运行实例"
           value={`${dashboard.summary.runningInstances}`}
+          count={dashboard.summary.runningInstances}
           suffix={`/ ${dashboard.summary.totalInstances}`}
           icon={<Power size={19} />}
           tone="mint"
@@ -838,6 +864,7 @@ function Overview({
         <Metric
           label="在线节点"
           value={`${dashboard.summary.onlineNodes}`}
+          count={dashboard.summary.onlineNodes}
           suffix={`/ ${dashboard.summary.totalNodes}`}
           icon={<Network size={19} />}
           tone="forest"
@@ -845,6 +872,7 @@ function Overview({
         <Metric
           label="待执行任务"
           value={String(dashboard.summary.queuedTasks)}
+          count={dashboard.summary.queuedTasks}
           icon={<Clock3 size={19} />}
           tone="amber"
         />
@@ -887,6 +915,7 @@ function Overview({
             <Empty
               icon={<Server size={24} />}
               title="还没有实例"
+              hint="接入第一台服务器，从这里掌控全局"
               action="创建实例"
               onAction={onNew}
             />
@@ -944,22 +973,26 @@ function Overview({
 function Metric({
   label,
   value,
+  count,
   suffix,
   icon,
   tone,
 }: {
   label: string;
   value: string;
+  count?: number;
   suffix?: string;
   icon: ReactNode;
   tone: string;
 }) {
+  const animated = useAnimatedNumber(count ?? 0);
+  const display = typeof count === "number" ? String(animated) : value;
   return (
     <section className={`metric ${tone}`}>
       <span className="metric-icon">{icon}</span>
       <p>{label}</p>
       <strong>
-        {value}
+        {display}
         <small>{suffix}</small>
       </strong>
     </section>
@@ -1029,6 +1062,7 @@ function Instances({
         <Empty
           icon={<Boxes size={24} />}
           title="没有符合条件的实例"
+          hint="试试切换上方的筛选条件"
           action="创建实例"
           onAction={onNew}
         />
@@ -1176,6 +1210,7 @@ function Nodes({ nodes, selectedId, onSelect, canViewMetrics, onNew, onDelete }:
         <Empty
           icon={<Network size={25} />}
           title="还没有受管节点"
+          hint="添加一台机器作为节点，部署你的 Minecraft 服务器"
           action="添加节点"
           onAction={onNew}
         />
@@ -1309,9 +1344,11 @@ function Tasks({
 function Backups({
   backups,
   instances,
+  onRestore,
 }: {
   backups: Backup[];
   instances: Instance[];
+  onRestore?: (backup: Backup) => void;
 }) {
   return (
     <section className="panel table-panel">
@@ -1355,11 +1392,21 @@ function Backups({
                       : "running"
                 }
               />
+              {onRestore && backup.status === "available" && (
+                <button
+                  className="button compact"
+                  title="用此备份覆盖实例数据并重启"
+                  onClick={() => onRestore(backup)}
+                >
+                  <ArchiveRestore size={14} /> 恢复
+                </button>
+              )}
             </div>
           ))}
         </div>
       ) : (
-        <Empty icon={<DatabaseBackup size={24} />} title="还没有备份归档" />
+        <Empty icon={<DatabaseBackup size={24} />} title="还没有备份归档"
+          hint="对实例执行一次备份，数据就有了第一道防线" />
       )}
     </section>
   );
@@ -1661,6 +1708,101 @@ function UsersScreen({
   );
 }
 
+const auditLabels: Record<string, string> = {
+  "auth.bootstrap": "初始化控制面",
+  "auth.login": "登录",
+  "auth.login.challenged": "等待两步验证",
+  "auth.password_changed": "修改密码",
+  "auth.2fa.provisioned": "生成两步验证密钥",
+  "auth.2fa.enabled": "开启两步验证",
+  "auth.2fa.disabled": "关闭两步验证",
+  "token.created": "创建 API 令牌",
+  "token.revoked": "吊销 API 令牌",
+  "user.created": "创建用户",
+  "user.deleted": "删除用户",
+  "user.password_reset": "重置用户密码",
+  "user.role.updated": "调整用户角色",
+  "node.created": "创建节点",
+  "node.deleted": "删除节点",
+  "instance.created": "创建实例",
+  "instance.archived": "归档实例",
+  "instance.restored": "恢复实例",
+  "instance.config.updated": "更新实例配置",
+  "instance.member.added": "添加协作者",
+  "instance.member.removed": "移除协作者",
+  "instance.member.updated": "更新协作者权限",
+  "file.write": "写入文件",
+  "file.upload.queued": "排队上传文件",
+  "file.download.queued": "排队下载文件",
+  "backup.created": "创建备份",
+  "backup.restore.requested": "请求恢复备份",
+  "schedule.created": "创建调度任务",
+  "schedule.updated": "更新调度任务",
+  "schedule.deleted": "删除调度任务",
+  "task.retry.requested": "重试任务",
+  "artifact.uploaded": "上传服务器包",
+  agent: "Agent 连接",
+  system: "系统事件"
+};
+
+const auditCategories: Array<{ label: string; actions: string[] }> = [
+  {
+    label: "认证与安全",
+    actions: [
+      "auth.bootstrap",
+      "auth.login",
+      "auth.login.challenged",
+      "auth.password_changed",
+      "auth.2fa.provisioned",
+      "auth.2fa.enabled",
+      "auth.2fa.disabled",
+      "token.created",
+      "token.revoked"
+    ]
+  },
+  {
+    label: "用户",
+    actions: [
+      "user.created",
+      "user.deleted",
+      "user.password_reset",
+      "user.role.updated"
+    ]
+  },
+  {
+    label: "节点与实例",
+    actions: [
+      "node.created",
+      "node.deleted",
+      "instance.created",
+      "instance.archived",
+      "instance.restored",
+      "instance.config.updated",
+      "instance.member.added",
+      "instance.member.removed",
+      "instance.member.updated"
+    ]
+  },
+  {
+    label: "文件与备份",
+    actions: [
+      "file.write",
+      "file.upload.queued",
+      "file.download.queued",
+      "backup.created",
+      "backup.restore.requested"
+    ]
+  },
+  {
+    label: "调度与任务",
+    actions: ["schedule.created", "schedule.updated", "schedule.deleted", "task.retry.requested"]
+  },
+  {
+    label: "系统",
+    actions: ["agent", "artifact.uploaded", "system"]
+  }
+];
+
 function Audit({
   events,
   allow,
@@ -1674,6 +1816,7 @@ function Audit({
   }>;
   allow: boolean;
 }) {
+  const [category, setCategory] = useState("全部");
   if (!allow)
     return (
       <section className="panel">
@@ -1683,6 +1826,15 @@ function Audit({
         />
       </section>
     );
+  const filtered =
+    category === "全部"
+      ? events
+      : events.filter(
+          (event) =>
+            auditCategories
+              .find((group) => group.label === category)
+              ?.actions.includes(event.action) ?? false,
+        );
   return (
     <section className="panel table-panel">
       <div className="panel-heading">
@@ -1690,16 +1842,34 @@ function Audit({
           <p className="eyebrow">Security trail</p>
           <h3>操作审计</h3>
         </div>
+        <span className="audit-count">{filtered.length} 条</span>
       </div>
-      {events.length ? (
+      <div className="audit-filters">
+        <button
+          className={category === "全部" ? "active" : ""}
+          onClick={() => setCategory("全部")}
+        >
+          全部
+        </button>
+        {auditCategories.map((group) => (
+          <button
+            key={group.label}
+            className={category === group.label ? "active" : ""}
+            onClick={() => setCategory(group.label)}
+          >
+            {group.label}
+          </button>
+        ))}
+      </div>
+      {filtered.length ? (
         <div className="audit-list">
-          {events.map((event) => (
+          {filtered.map((event) => (
             <div className="audit-row" key={event.id}>
               <ShieldCheck size={17} />
               <span>
-                <strong>{event.action}</strong>
+                <strong>{auditLabels[event.action] ?? event.action}</strong>
                 <small>
-                  {event.target}
+                  <code>{event.action}</code> {event.target}
                   {event.detail ? ` · ${event.detail}` : ""}
                 </small>
               </span>
@@ -1708,7 +1878,7 @@ function Audit({
           ))}
         </div>
       ) : (
-        <p className="quiet">尚未记录控制面操作。</p>
+        <p className="quiet">该分类下暂无审计记录。</p>
       )}
     </section>
   );
@@ -1743,6 +1913,7 @@ function InstanceWorkspace({
   const [fileBusy, setFileBusy] = useState(false);
   const [transfer, setTransfer] = useState<FileTransfer>();
   const [confirmArchive, setConfirmArchive] = useState(false);
+  const [restoreTarget, setRestoreTarget] = useState<Backup>();
   useEffect(() => {
     setTab("console");
     setDirectory("/");
@@ -1936,6 +2107,20 @@ function InstanceWorkspace({
       reload();
     } catch (error) {
       notify(error instanceof Error ? error.message : "实例未恢复", "error");
+    }
+  };
+  const restoreBackup = async () => {
+    if (!restoreTarget) return;
+    try {
+      await api(
+        `/api/instances/${instance.id}/backups/${restoreTarget.id}/restore`,
+        { method: "POST" },
+      );
+      setRestoreTarget(undefined);
+      notify(`备份 “${restoreTarget.name}” 恢复任务已提交`);
+      reload();
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "备份恢复未完成", "error");
     }
   };
   return (
@@ -2250,7 +2435,11 @@ function InstanceWorkspace({
             创建备份
           </button>
           {detail?.backups.length ? (
-            <Backups backups={detail.backups} instances={[instance]} />
+            <Backups
+              backups={detail.backups}
+              instances={[instance]}
+              onRestore={setRestoreTarget}
+            />
           ) : (
             <p className="quiet">创建备份后可在此查看归档状态。</p>
           )}
@@ -2278,6 +2467,15 @@ function InstanceWorkspace({
           confirmLabel="归档"
           onConfirm={archiveInstance}
           onCancel={() => setConfirmArchive(false)}
+        />
+      )}
+      {restoreTarget && (
+        <ConfirmDialog
+          title="恢复备份"
+          body={`确定用备份 “${restoreTarget.name}” 覆盖实例 “${instance.name}” 的当前数据吗？实例将停止、数据被替换并自动重启。`}
+          confirmLabel="恢复备份"
+          onConfirm={restoreBackup}
+          onCancel={() => setRestoreTarget(undefined)}
         />
       )}
     </section>
@@ -2326,7 +2524,12 @@ function InstanceMetrics({ instance }: { instance: Instance }) {
         ))}
       </div>
       <div className="metrics-summary">
-        <MetricReadout label="CPU" value={latest ? `${latest.cpuPercent.toFixed(1)}%` : "--"} />
+        <MetricReadout
+          label="CPU"
+          value={latest ? `${latest.cpuPercent.toFixed(1)}%` : "--"}
+          count={latest?.cpuPercent}
+          format={(value) => `${value.toFixed(1)}%`}
+        />
         <MetricReadout label="内存" value={latest ? `${formatBytes(latest.memoryBytes)} / ${formatBytes(latest.memoryLimitBytes)}` : "--"} />
         <MetricReadout label="累计 RX" value={latest ? formatBytes(latest.networkRxBytes) : "--"} />
         <MetricReadout label="PID" value={latest?.pids === undefined ? "--" : String(latest.pids)} />
@@ -2341,8 +2544,20 @@ function InstanceMetrics({ instance }: { instance: Instance }) {
   );
 }
 
-function MetricReadout({ label, value }: { label: string; value: string }) {
-  return <div className="metric-readout"><small>{label}</small><strong>{value}</strong></div>;
+function MetricReadout({
+  label,
+  value,
+  count,
+  format,
+}: {
+  label: string;
+  value: string;
+  count?: number;
+  format?: (value: number) => string;
+}) {
+  const animated = useAnimatedNumber(count ?? 0);
+  const display = typeof count === "number" ? (format ? format(animated) : String(animated)) : value;
+  return <div className="metric-readout"><small>{label}</small><strong>{display}</strong></div>;
 }
 
 function MetricChart({ title, points, suffix, color, max, format = (value: number) => value.toFixed(0) }: { title: string; points: number[]; suffix: string; color: string; max: number; format?: (value: number) => string }) {
@@ -2363,7 +2578,7 @@ function MetricChart({ title, points, suffix, color, max, format = (value: numbe
         <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={title} preserveAspectRatio="none">
           <line x1={padding} x2={width - padding} y1={height - padding} y2={height - padding} />
           <line x1={padding} x2={width - padding} y1={padding} y2={padding} />
-          <path d={path} style={{ stroke: color }} />
+          <path d={path} pathLength={1} style={{ stroke: color }} />
         </svg>
       ) : <div className="metric-chart-empty">等待节点连接</div>}
     </article>
@@ -3175,7 +3390,8 @@ function InstanceModal({
           </button>
         </form>
       ) : (
-        <Empty icon={<Network size={24} />} title="请先添加节点" />
+        <Empty icon={<Network size={24} />} title="请先添加节点"
+          hint="创建实例至少需要一个可用节点" />
       )}
     </Dialog>
   );
@@ -3291,6 +3507,52 @@ function SecurityDialog({
       );
     } finally {
       setTotpBusy(false);
+    }
+  };
+  const [apiTokens, setApiTokens] = useState<ApiToken[]>([]);
+  const [tokenName, setTokenName] = useState("");
+  const [tokenBusy, setTokenBusy] = useState(false);
+  const [createdToken, setCreatedToken] = useState<string>();
+  const loadTokens = async () => {
+    try {
+      const result = await api<{ apiTokens: ApiToken[] }>("/api/tokens");
+      setApiTokens(result.apiTokens);
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "无法读取 API 令牌", "error");
+    }
+  };
+  useEffect(() => {
+    void loadTokens();
+  }, []);
+  const createToken = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const name = tokenName.trim();
+    if (!name || tokenBusy) return;
+    setTokenBusy(true);
+    try {
+      const result = await api<{ token: string }>("/api/tokens", {
+        method: "POST",
+        body: JSON.stringify({ name }),
+      });
+      setCreatedToken(result.token);
+      setTokenName("");
+      await loadTokens();
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "令牌创建失败", "error");
+    } finally {
+      setTokenBusy(false);
+    }
+  };
+  const revokeToken = async (token: ApiToken) => {
+    setTokenBusy(true);
+    try {
+      await api(`/api/tokens/${token.id}`, { method: "DELETE" });
+      notify(`令牌 “${token.name}” 已吊销`);
+      setApiTokens((current) => current.filter((item) => item.id !== token.id));
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "令牌吊销失败", "error");
+    } finally {
+      setTokenBusy(false);
     }
   };
   return (
@@ -3471,6 +3733,91 @@ function SecurityDialog({
               </div>
             )}
           </section>
+          <section className="security-section">
+            <div className="security-head">
+              <h4>
+                <KeyRound size={16} /> API 访问令牌
+              </h4>
+              <span className="security-state">
+                {apiTokens.length ? `${apiTokens.length} 个` : "未创建"}
+              </span>
+            </div>
+            <p className="security-note">
+              令牌用于脚本与自动化工具调用控制面 API，通过{" "}
+              <code>Authorization: Bearer &lt;token&gt;</code>{" "}
+              认证。令牌明文只在创建时显示一次，请立即保存。
+            </p>
+            {createdToken && (
+              <div className="token-created">
+                <span>新令牌已创建（仅显示一次）</span>
+                <code>{createdToken}</code>
+                <button
+                  className="button compact"
+                  onClick={() => {
+                    void navigator.clipboard?.writeText(createdToken);
+                    notify("令牌已复制到剪贴板");
+                  }}
+                >
+                  <Copy size={14} /> 复制令牌
+                </button>
+                <button
+                  className="icon-button"
+                  title="关闭"
+                  onClick={() => setCreatedToken(undefined)}
+                >
+                  <X size={15} />
+                </button>
+              </div>
+            )}
+            <form className="security-form token-create" onSubmit={createToken}>
+              <label>
+                令牌名称
+                <input
+                  value={tokenName}
+                  onChange={(event) => setTokenName(event.target.value)}
+                  maxLength={64}
+                  required
+                  placeholder="例如：ci-deploy、备份脚本"
+                />
+              </label>
+              <button
+                className="button"
+                type="submit"
+                disabled={tokenBusy || !tokenName.trim()}
+              >
+                {tokenBusy && <LoaderCircle size={16} className="spin" />}
+                <Plus size={16} /> 创建令牌
+              </button>
+            </form>
+            {apiTokens.length ? (
+              <div className="token-list">
+                {apiTokens.map((token) => (
+                  <div className="token-row" key={token.id}>
+                    <KeyRound size={16} />
+                    <span>
+                      <strong>{token.name}</strong>
+                      <small>
+                        创建于 {formatTime(token.createdAt)}
+                        {token.lastUsedAt
+                          ? ` · 最近使用 ${formatTime(token.lastUsedAt)}`
+                          : " · 尚未使用"}
+                      </small>
+                    </span>
+                    <button
+                      className="icon-button danger"
+                      title="吊销令牌"
+                      disabled={tokenBusy}
+                      onClick={() => void revokeToken(token)}
+                    >
+                      <Trash2 size={15} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="quiet">尚未创建 API 令牌。</p>
+            )}
+          </section>
         </div>
       </section>
     </div>
@@ -3576,11 +3923,13 @@ function Status({
 function Empty({
   icon,
   title,
+  hint,
   action,
   onAction,
 }: {
   icon: ReactNode;
   title: string;
+  hint?: string;
   action?: string;
   onAction?: () => void;
 }) {
@@ -3588,6 +3937,7 @@ function Empty({
     <div className="empty">
       <span>{icon}</span>
       <p>{title}</p>
+      {hint && <small>{hint}</small>}
       {action && (
         <button className="button compact" onClick={onAction}>
           {action}

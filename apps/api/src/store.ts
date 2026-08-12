@@ -29,6 +29,7 @@ const normalizeState = (state: PanelState): PanelState => {
   }
   state.artifacts ??= [];
   state.fileTransfers ??= [];
+  state.apiTokens ??= [];
   return state;
 };
 
