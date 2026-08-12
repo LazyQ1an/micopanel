@@ -156,7 +156,17 @@ export function App() {
   if (status.setupRequired)
     return <AuthScreen mode="setup" onComplete={refresh} />;
   if (!status.user) return <AuthScreen mode="login" onComplete={refresh} />;
-  return <ControlPanel user={status.user} onSignOut={refresh} />;
+  return (
+    <ControlPanel
+      user={status.user}
+      onSignOut={refresh}
+      onUserUpdated={(next) =>
+        setStatus((current) =>
+          current ? { ...current, user: next } : current,
+        )
+      }
+    />
+  );
 }
 
 function AuthScreen({
@@ -168,17 +178,49 @@ function AuthScreen({
 }) {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [twoFactor, setTwoFactor] = useState<{
+    username: string;
+    password: string;
+  }>();
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    const username = String(data.get("username") ?? "");
+    const password = String(data.get("password") ?? "");
+    setBusy(true);
+    setError("");
+    try {
+      const result = await api<{ user?: User; twoFactorRequired?: boolean }>(
+        `/api/auth/${mode === "setup" ? "bootstrap" : "login"}`,
+        {
+          method: "POST",
+          body: JSON.stringify({ username, password }),
+        },
+      );
+      if (mode === "login" && result.twoFactorRequired) {
+        setTwoFactor({ username, password });
+        return;
+      }
+      await onComplete();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "无法完成登录");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const submitCode = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!twoFactor) return;
     const data = new FormData(event.currentTarget);
     setBusy(true);
     setError("");
     try {
-      await api(`/api/auth/${mode === "setup" ? "bootstrap" : "login"}`, {
+      await api("/api/auth/login", {
         method: "POST",
         body: JSON.stringify({
-          username: data.get("username"),
-          password: data.get("password"),
+          username: twoFactor.username,
+          password: twoFactor.password,
+          code: data.get("code"),
         }),
       });
       await onComplete();
@@ -188,6 +230,7 @@ function AuthScreen({
       setBusy(false);
     }
   };
+  const challenge = mode === "login" && twoFactor;
   return (
     <main className="auth-layout">
       <section className="auth-intro">
@@ -210,48 +253,90 @@ function AuthScreen({
         </div>
       </section>
       <section className="auth-form-wrap">
-        <form className="auth-form" onSubmit={submit}>
-          <p className="eyebrow">
-            {mode === "setup" ? "Initial setup" : "Welcome back"}
-          </p>
-          <h2>{mode === "setup" ? "创建首个管理员" : "登录控制面"}</h2>
-          <label>
-            用户名
-            <input
-              name="username"
-              autoComplete="username"
-              minLength={3}
-              required
-              placeholder="admin"
-            />
-          </label>
-          <label>
-            密码
-            <input
-              name="password"
-              type="password"
-              autoComplete={
-                mode === "login" ? "current-password" : "new-password"
-              }
-              minLength={10}
-              required
-              placeholder="至少 10 个字符"
-            />
-          </label>
-          {error && (
-            <p className="form-error">
-              <CircleAlert size={16} /> {error}
+        {challenge ? (
+          <form className="auth-form" onSubmit={submitCode}>
+            <p className="eyebrow">Two-factor authentication</p>
+            <h2>输入两步验证码</h2>
+            <p className="auth-hint">
+              账号 {twoFactor.username} 已开启两步验证，请输入身份验证器中的 6
+              位动态码，或使用一次性恢复码。
             </p>
-          )}
-          <button className="button primary full" type="submit" disabled={busy}>
-            {busy ? (
-              <LoaderCircle size={17} className="spin" />
-            ) : (
-              <ChevronRight size={17} />
+            <label>
+              验证码
+              <input
+                name="code"
+                inputMode="numeric"
+                autoComplete="one-time-code"
+                minLength={6}
+                required
+                placeholder="6 位动态码"
+              />
+            </label>
+            {error && (
+              <p className="form-error">
+                <CircleAlert size={16} /> {error}
+              </p>
             )}
-            {mode === "setup" ? "创建并进入面板" : "登录"}
-          </button>
-        </form>
+            <button className="button primary full" type="submit" disabled={busy}>
+              {busy ? (
+                <LoaderCircle size={17} className="spin" />
+              ) : (
+                <ChevronRight size={17} />
+              )}
+              验证并登录
+            </button>
+            <button
+              className="auth-back"
+              type="button"
+              onClick={() => setTwoFactor(undefined)}
+            >
+              返回重新输入密码
+            </button>
+          </form>
+        ) : (
+          <form className="auth-form" onSubmit={submit}>
+            <p className="eyebrow">
+              {mode === "setup" ? "Initial setup" : "Welcome back"}
+            </p>
+            <h2>{mode === "setup" ? "创建首个管理员" : "登录控制面"}</h2>
+            <label>
+              用户名
+              <input
+                name="username"
+                autoComplete="username"
+                minLength={3}
+                required
+                placeholder="admin"
+              />
+            </label>
+            <label>
+              密码
+              <input
+                name="password"
+                type="password"
+                autoComplete={
+                  mode === "login" ? "current-password" : "new-password"
+                }
+                minLength={10}
+                required
+                placeholder="至少 10 个字符"
+              />
+            </label>
+            {error && (
+              <p className="form-error">
+                <CircleAlert size={16} /> {error}
+              </p>
+            )}
+            <button className="button primary full" type="submit" disabled={busy}>
+              {busy ? (
+                <LoaderCircle size={17} className="spin" />
+              ) : (
+                <ChevronRight size={17} />
+              )}
+              {mode === "setup" ? "创建并进入面板" : "登录"}
+            </button>
+          </form>
+        )}
       </section>
     </main>
   );
@@ -260,12 +345,15 @@ function AuthScreen({
 function ControlPanel({
   user,
   onSignOut,
+  onUserUpdated,
 }: {
   user: User;
   onSignOut: () => Promise<void>;
+  onUserUpdated: (user: User) => void;
 }) {
   const [screen, setScreen] = useState<Screen>("overview");
   const [panelOpen, setPanelOpen] = useState(false);
+  const [securityOpen, setSecurityOpen] = useState(false);
   const [dashboard, setDashboard] = useState<Dashboard>();
   const [selectedId, setSelectedId] = useState<string>();
   const [selectedNodeId, setSelectedNodeId] = useState<string>();
@@ -496,6 +584,13 @@ function ControlPanel({
           </div>
           <button
             className="icon-button"
+            title="安全设置"
+            onClick={() => setSecurityOpen(true)}
+          >
+            <Settings2 size={18} />
+          </button>
+          <button
+            className="icon-button"
             title="退出登录"
             onClick={() => void signOut()}
           >
@@ -636,6 +731,14 @@ function ControlPanel({
           onClose={() => setModal(null)}
           refresh={refresh}
           notify={notify}
+        />
+      )}
+      {securityOpen && (
+        <SecurityDialog
+          user={user}
+          onClose={() => setSecurityOpen(false)}
+          notify={notify}
+          onUserUpdated={onUserUpdated}
         />
       )}
       {confirm && (
@@ -3075,6 +3178,302 @@ function InstanceModal({
         <Empty icon={<Network size={24} />} title="请先添加节点" />
       )}
     </Dialog>
+  );
+}
+
+function SecurityDialog({
+  user,
+  onClose,
+  notify,
+  onUserUpdated,
+}: {
+  user: User;
+  onClose: () => void;
+  notify: (message?: string, tone?: "success" | "error") => void;
+  onUserUpdated: (user: User) => void;
+}) {
+  const [passwordBusy, setPasswordBusy] = useState(false);
+  const [totpBusy, setTotpBusy] = useState(false);
+  const [totp, setTotp] = useState<{
+    secret: string;
+    qrDataUrl: string;
+    otpauthUrl: string;
+  }>();
+  const [recoveryCodes, setRecoveryCodes] = useState<string[]>();
+  const [disableCode, setDisableCode] = useState("");
+  const changePassword = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const data = new FormData(form);
+    const currentPassword = String(data.get("currentPassword") ?? "");
+    const newPassword = String(data.get("newPassword") ?? "");
+    const confirmPassword = String(data.get("confirmPassword") ?? "");
+    if (newPassword !== confirmPassword) {
+      notify("两次输入的新密码不一致", "error");
+      return;
+    }
+    setPasswordBusy(true);
+    try {
+      await api("/api/auth/password", {
+        method: "POST",
+        body: JSON.stringify({ currentPassword, newPassword }),
+      });
+      notify("密码已更新，其他设备已退出登录");
+      form.reset();
+    } catch (error) {
+      notify(
+        error instanceof Error ? error.message : "密码修改失败",
+        "error",
+      );
+    } finally {
+      setPasswordBusy(false);
+    }
+  };
+  const provision = async () => {
+    setTotpBusy(true);
+    try {
+      const result = await api<{
+        secret: string;
+        qrDataUrl: string;
+        otpauthUrl: string;
+      }>("/api/auth/2fa/provision", { method: "POST" });
+      setTotp(result);
+    } catch (error) {
+      notify(
+        error instanceof Error ? error.message : "无法生成两步验证密钥",
+        "error",
+      );
+    } finally {
+      setTotpBusy(false);
+    }
+  };
+  const enable = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!totp) return;
+    const data = new FormData(event.currentTarget);
+    setTotpBusy(true);
+    try {
+      const result = await api<{ recoveryCodes: string[]; user: User }>(
+        "/api/auth/2fa/enable",
+        {
+          method: "POST",
+          body: JSON.stringify({ code: data.get("code") }),
+        },
+      );
+      setRecoveryCodes(result.recoveryCodes);
+      onUserUpdated(result.user);
+      notify("两步验证已开启");
+    } catch (error) {
+      notify(
+        error instanceof Error ? error.message : "两步验证开启失败",
+        "error",
+      );
+    } finally {
+      setTotpBusy(false);
+    }
+  };
+  const disable = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setTotpBusy(true);
+    try {
+      await api("/api/auth/2fa/disable", {
+        method: "POST",
+        body: JSON.stringify({ code: disableCode }),
+      });
+      setDisableCode("");
+      setTotp(undefined);
+      onUserUpdated({ ...user, twoFactorEnabled: false });
+      notify("两步验证已关闭");
+    } catch (error) {
+      notify(
+        error instanceof Error ? error.message : "两步验证关闭失败",
+        "error",
+      );
+    } finally {
+      setTotpBusy(false);
+    }
+  };
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <section
+        className="dialog security-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-label="安全设置"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <div className="dialog-head">
+          <h3>
+            <ShieldCheck size={18} /> 安全设置
+          </h3>
+          <button className="icon-button" title="关闭" onClick={onClose}>
+            <X size={18} />
+          </button>
+        </div>
+        <div className="security-sections">
+          <section className="security-section">
+            <div className="security-head">
+              <h4>修改密码</h4>
+              <span className="security-state">已启用</span>
+            </div>
+            <p className="security-note">
+              修改后其他设备的会话将立即失效，请妥善保管新密码。
+            </p>
+            <form className="security-form" onSubmit={changePassword}>
+              <label>
+                当前密码
+                <input
+                  name="currentPassword"
+                  type="password"
+                  autoComplete="current-password"
+                  required
+                />
+              </label>
+              <label>
+                新密码
+                <input
+                  name="newPassword"
+                  type="password"
+                  autoComplete="new-password"
+                  minLength={10}
+                  required
+                  placeholder="至少 10 个字符"
+                />
+              </label>
+              <label>
+                确认新密码
+                <input
+                  name="confirmPassword"
+                  type="password"
+                  autoComplete="new-password"
+                  minLength={10}
+                  required
+                />
+              </label>
+              <button
+                className="button primary"
+                type="submit"
+                disabled={passwordBusy}
+              >
+                {passwordBusy && <LoaderCircle size={16} className="spin" />}
+                更新密码
+              </button>
+            </form>
+          </section>
+          <section className="security-section">
+            <div className="security-head">
+              <h4>两步验证（TOTP）</h4>
+              <span
+                className={`security-state ${
+                  user.twoFactorEnabled ? "on" : "off"
+                }`}
+              >
+                {user.twoFactorEnabled ? "已开启" : "未开启"}
+              </span>
+            </div>
+            {!user.twoFactorEnabled && !totp && !recoveryCodes && (
+              <>
+                <p className="security-note">
+                  开启后登录需要输入身份验证器中的 6
+                  位动态码，显著降低账号被盗风险。
+                </p>
+                <button
+                  className="button"
+                  onClick={() => void provision()}
+                  disabled={totpBusy}
+                >
+                  {totpBusy && <LoaderCircle size={16} className="spin" />}
+                  开启两步验证
+                </button>
+              </>
+            )}
+            {!user.twoFactorEnabled && totp && !recoveryCodes && (
+              <div className="totp-setup">
+                <p className="security-note">
+                  使用身份验证器（Google Authenticator、Microsoft
+                  Authenticator、1Password 等）扫描二维码，或手动输入密钥。
+                </p>
+                <img
+                  className="totp-qr"
+                  src={totp.qrDataUrl}
+                  alt="两步验证二维码"
+                />
+                <code className="totp-secret">{totp.secret}</code>
+                <form className="security-form" onSubmit={enable}>
+                  <label>
+                    6 位动态码
+                    <input
+                      name="code"
+                      inputMode="numeric"
+                      pattern="[0-9]{6}"
+                      required
+                      placeholder="输入身份验证器中的验证码"
+                    />
+                  </label>
+                  <button
+                    className="button primary"
+                    type="submit"
+                    disabled={totpBusy}
+                  >
+                    {totpBusy && <LoaderCircle size={16} className="spin" />}
+                    验证并开启
+                  </button>
+                </form>
+              </div>
+            )}
+            {recoveryCodes && (
+              <div className="recovery-codes">
+                <p className="security-note">
+                  请立即保存这些恢复码。每个恢复码只能使用一次，用于手机丢失时登录。
+                </p>
+                <div className="recovery-grid">
+                  {recoveryCodes.map((code) => (
+                    <code key={code}>{code}</code>
+                  ))}
+                </div>
+                <button
+                  className="button"
+                  onClick={() => {
+                    void navigator.clipboard?.writeText(
+                      recoveryCodes.join("\n"),
+                    );
+                    notify("恢复码已复制到剪贴板");
+                  }}
+                >
+                  <Copy size={16} /> 复制全部恢复码
+                </button>
+              </div>
+            )}
+            {user.twoFactorEnabled && !recoveryCodes && (
+              <div className="totp-enabled">
+                <p className="security-note">
+                  两步验证已开启。关闭需要输入当前动态码或一条未使用的恢复码。
+                </p>
+                <form className="security-form" onSubmit={disable}>
+                  <label>
+                    动态码或恢复码
+                    <input
+                      value={disableCode}
+                      onChange={(event) => setDisableCode(event.target.value)}
+                      required
+                      placeholder="6 位动态码或恢复码"
+                    />
+                  </label>
+                  <button
+                    className="button danger"
+                    type="submit"
+                    disabled={totpBusy || !disableCode.trim()}
+                  >
+                    {totpBusy && <LoaderCircle size={16} className="spin" />}
+                    关闭两步验证
+                  </button>
+                </form>
+              </div>
+            )}
+          </section>
+        </div>
+      </section>
+    </div>
   );
 }
 

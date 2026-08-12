@@ -5,6 +5,7 @@ export interface User {
   username: string;
   role: "admin" | "user";
   createdAt: string;
+  twoFactorEnabled?: boolean;
 }
 
 export interface Node {

@@ -117,6 +117,13 @@ original operation permission can explicitly resubmit a failed task from the tas
 
 - Browser sessions use signed, HttpOnly cookies.
 - Passwords are hashed with Argon2.
+- Every account can enable TOTP two-factor authentication (RFC 6238) with a
+  QR-code onboarding flow; logins on 2FA accounts require a time-based code or
+  a single-use recovery code, and used recovery codes are revoked immediately.
+- Users can change their own password with the current password; changing it
+  revokes every other session while keeping the current one. An administrator
+  password reset also clears the account's two-factor setup so an account can
+  never be locked out by a lost authenticator.
 - Node enrollment tokens are single-use and stored hashed.
 - Agents maintain outbound WebSocket connections and never publish the Docker socket.
 - Custom package downloads are authorized with short-lived tokens and are verified by SHA-256

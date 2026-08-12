@@ -3,6 +3,7 @@ import { rm } from "node:fs/promises";
 import test from "node:test";
 import { buildServer } from "./server.js";
 import { MemoryStore } from "./store.js";
+import { totpCode } from "./totp.js";
 
 const testConfig = {
   NODE_ENV: "test" as const,
@@ -391,3 +392,86 @@ test("admins manage users and nodes with safety guards", async () => {
   }
 });
 
+test("two-factor authentication protects login and password changes", async () => {
+  const store = new MemoryStore();
+  const app = await buildServer({ config: testConfig, store });
+  let loginCounter = 0;
+  const loginAs = (payload: unknown) => {
+    loginCounter += 1;
+    return app.inject({ method: "POST", url: "/api/auth/login", remoteAddress: `10.9.${Math.floor(loginCounter / 250)}.${loginCounter % 250}`, ...json(payload) });
+  };
+  try {
+    await app.inject({ method: "POST", url: "/api/auth/bootstrap", ...json({ username: "root", password: "correct-password-123" }) });
+    const firstLogin = await loginAs({ username: "root", password: "correct-password-123" });
+    assert.equal(firstLogin.statusCode, 200);
+    const cookie = String(firstLogin.headers["set-cookie"]).split(";")[0];
+
+    // password change requires the current password and revokes other sessions
+    const wrongCurrent = await app.inject({ method: "POST", url: "/api/auth/password", headers: { cookie, "content-type": "application/json" }, payload: JSON.stringify({ currentPassword: "nope", newPassword: "next-password-456" }) });
+    assert.equal(wrongCurrent.statusCode, 401);
+    const samePassword = await app.inject({ method: "POST", url: "/api/auth/password", headers: { cookie, "content-type": "application/json" }, payload: JSON.stringify({ currentPassword: "correct-password-123", newPassword: "correct-password-123" }) });
+    assert.equal(samePassword.statusCode, 422);
+    const secondLogin = await loginAs({ username: "root", password: "correct-password-123" });
+    const secondCookie = String(secondLogin.headers["set-cookie"]).split(";")[0];
+    assert.equal((await app.inject({ method: "POST", url: "/api/auth/password", headers: { cookie: secondCookie, "content-type": "application/json" }, payload: JSON.stringify({ currentPassword: "correct-password-123", newPassword: "next-password-456" }) })).statusCode, 204);
+    assert.equal((await loginAs({ username: "root", password: "correct-password-123" })).statusCode, 401);
+    assert.equal((await app.inject({ method: "GET", url: "/api/dashboard", headers: { cookie: secondCookie } })).statusCode, 200);
+
+    // provision 2FA, enable with a fresh TOTP code, and keep the recovery codes
+    const provision = await app.inject({ method: "POST", url: "/api/auth/2fa/provision", headers: { cookie: secondCookie } });
+    assert.equal(provision.statusCode, 200);
+    const provisioned = provision.json() as { secret: string; qrDataUrl: string; otpauthUrl: string };
+    assert.match(provisioned.secret, /^[A-Z2-7]{16,}$/);
+    assert.match(provisioned.qrDataUrl, /^data:image\/png;base64,/);
+    const enable = await app.inject({ method: "POST", url: "/api/auth/2fa/enable", headers: { cookie: secondCookie, "content-type": "application/json" }, payload: JSON.stringify({ code: totpCode(provisioned.secret) }) });
+    assert.equal(enable.statusCode, 200);
+    const recoveryCodes = (enable.json() as { recoveryCodes: string[] }).recoveryCodes;
+    assert.equal(recoveryCodes.length, 10);
+    assert.equal((await app.inject({ method: "POST", url: "/api/auth/2fa/provision", headers: { cookie: secondCookie } })).statusCode, 409);
+
+    // login now demands the second factor
+    const challenged = await loginAs({ username: "root", password: "next-password-456" });
+    assert.equal(challenged.statusCode, 200);
+    assert.equal(challenged.json().twoFactorRequired, true);
+    assert.equal(challenged.headers["set-cookie"], undefined);
+    const wrongCode = await loginAs({ username: "root", password: "next-password-456", code: "000000" });
+    assert.equal(wrongCode.statusCode, 401);
+    const totpLogin = await loginAs({ username: "root", password: "next-password-456", code: totpCode(provisioned.secret) });
+    assert.equal(totpLogin.statusCode, 200);
+    assert.match(String(totpLogin.headers["set-cookie"]), /^mico_session=/);
+
+    // recovery codes are single-use
+    const recoveryLogin = await loginAs({ username: "root", password: "next-password-456", code: recoveryCodes[0] });
+    assert.equal(recoveryLogin.statusCode, 200);
+    const reusedRecovery = await loginAs({ username: "root", password: "next-password-456", code: recoveryCodes[0] });
+    assert.equal(reusedRecovery.statusCode, 401);
+
+    // an admin password reset clears the user's 2FA so they cannot be locked out
+    const member = await app.inject({ method: "POST", url: "/api/users", headers: { cookie: secondCookie, "content-type": "application/json" }, payload: JSON.stringify({ username: "builder", password: "builder-password-123", role: "user" }) });
+    const memberId = member.json().user.id;
+    const memberLogin = await loginAs({ username: "builder", password: "builder-password-123" });
+    const memberCookie = String(memberLogin.headers["set-cookie"]).split(";")[0];
+    const memberProvision = await app.inject({ method: "POST", url: "/api/auth/2fa/provision", headers: { cookie: memberCookie } });
+    await app.inject({ method: "POST", url: "/api/auth/2fa/enable", headers: { cookie: memberCookie, "content-type": "application/json" }, payload: JSON.stringify({ code: totpCode(memberProvision.json().secret) }) });
+    await app.inject({ method: "PUT", url: `/api/users/${memberId}`, headers: { cookie: secondCookie, "content-type": "application/json" }, payload: JSON.stringify({ password: "reset-password-789" }) });
+    const memberAfterReset = await loginAs({ username: "builder", password: "reset-password-789" });
+    assert.equal(memberAfterReset.statusCode, 200);
+    assert.equal(memberAfterReset.json().twoFactorRequired, undefined);
+
+    // disable 2FA with a TOTP code, then login without a code again
+    const disable = await app.inject({ method: "POST", url: "/api/auth/2fa/disable", headers: { cookie: secondCookie, "content-type": "application/json" }, payload: JSON.stringify({ code: totpCode(provisioned.secret) }) });
+    assert.equal(disable.statusCode, 204);
+    const plainLogin = await loginAs({ username: "root", password: "next-password-456" });
+    assert.equal(plainLogin.statusCode, 200);
+    assert.equal(plainLogin.json().twoFactorRequired, undefined);
+
+    const audits = (await app.inject({ method: "GET", url: "/api/audit", headers: { cookie: secondCookie } })).json().audits as Array<{ action: string }>;
+    for (const action of ["auth.password_changed", "auth.2fa.enabled", "auth.2fa.disabled", "user.password_reset"]) {
+      assert.equal(audits.some((audit) => audit.action === action), true, `expected audit ${action}`);
+    }
+  } finally {
+    await app.close();
+    await rm(testConfig.ARTIFACTS_DIR, { recursive: true, force: true });
+    await rm(testConfig.FILE_TRANSFERS_DIR, { recursive: true, force: true });
+  }
+});

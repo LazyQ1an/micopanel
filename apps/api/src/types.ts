@@ -20,6 +20,9 @@ export interface User {
   passwordHash: string;
   role: UserRole;
   createdAt: string;
+  totpSecret?: string;
+  totpEnabled?: boolean;
+  recoveryCodes?: string[];
 }
 
 export interface Session {

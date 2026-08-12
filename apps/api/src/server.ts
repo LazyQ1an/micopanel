@@ -4,6 +4,7 @@ import multipart from "@fastify/multipart";
 import rateLimit from "@fastify/rate-limit";
 import websocket from "@fastify/websocket";
 import { createHash } from "node:crypto";
+import QRCode from "qrcode";
 import { createReadStream, createWriteStream } from "node:fs";
 import { mkdir, rm, stat } from "node:fs/promises";
 import { basename, extname, relative, resolve } from "node:path";
@@ -23,6 +24,7 @@ import {
 import { z } from "zod";
 import { loadConfig, type AppConfig } from "./config.js";
 import { hashPassword, hashToken, id, randomToken, verifyPassword, verifyToken } from "./security.js";
+import { generateRecoveryCodes, generateTotpSecret, otpauthUrl, recoveryCodeIndex, verifyRecoveryCode, verifyTotp } from "./totp.js";
 import {
   addAudit,
   allPermissions,
@@ -108,13 +110,15 @@ class RealtimeHub {
   }
 }
 
-const userPublic = (user: User) => ({ id: user.id, username: user.username, role: user.role, createdAt: user.createdAt });
+const userPublic = (user: User) => ({ id: user.id, username: user.username, role: user.role, createdAt: user.createdAt, twoFactorEnabled: Boolean(user.totpEnabled) });
 const unauthenticated = (reply: FastifyReply) => reply.code(401).send({ error: "需要登录后才能继续" });
 const forbidden = (reply: FastifyReply) => reply.code(403).send({ error: "没有执行此操作的权限" });
 const notFound = (reply: FastifyReply, message = "资源不存在") => reply.code(404).send({ error: message });
 
 const bootstrapSchema = z.object({ username: z.string().min(3).max(32), password: z.string().min(10).max(128) });
-const loginSchema = bootstrapSchema;
+const loginSchema = bootstrapSchema.extend({ code: z.string().min(1).max(32).optional() });
+const passwordChangeSchema = z.object({ currentPassword: z.string().min(1).max(128), newPassword: z.string().min(10).max(128) });
+const totpCodeSchema = z.object({ code: z.string().min(1).max(32) });
 const nodeSchema = z.object({
   name: z.string().min(2).max(64),
   portRangeStart: z.number().int().min(1024).max(65534).default(25565),
@@ -635,9 +639,101 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
     const state = await store.read();
     const user = state.users.find((candidate) => candidate.username.toLowerCase() === input.username.toLowerCase());
     if (!user || !(await verifyPassword(user.passwordHash, input.password))) return reply.code(401).send({ error: "用户名或密码不正确" });
+    if (user.totpEnabled) {
+      if (!input.code) {
+        await store.transaction((draft) => addAudit(draft, user.id, "auth.login.challenged", user.id, "等待两步验证"));
+        return { user: userPublic(user), twoFactorRequired: true };
+      }
+      const recoveryIndex = user.recoveryCodes ? recoveryCodeIndex(input.code, user.recoveryCodes) : -1;
+      const valid = recoveryIndex >= 0 || verifyTotp(user.totpSecret ?? "", input.code);
+      if (!valid) return reply.code(401).send({ error: "两步验证码不正确" });
+      if (recoveryIndex >= 0) {
+        await store.transaction((draft) => {
+          const target = draft.users.find((candidate) => candidate.id === user.id);
+          if (!target?.recoveryCodes) return;
+          target.recoveryCodes = target.recoveryCodes.filter((_, index) => index !== recoveryIndex);
+          addAudit(draft, user.id, "auth.login", user.id, "使用恢复码登录，恢复码已作废");
+        });
+      } else {
+        await store.transaction((draft) => addAudit(draft, user.id, "auth.login", user.id, "两步验证通过"));
+      }
+      await setSession(reply, user.id);
+      return { user: userPublic(user) };
+    }
     await setSession(reply, user.id);
     await store.transaction((draft) => addAudit(draft, user.id, "auth.login", user.id));
     return { user: userPublic(user) };
+  });
+
+  app.post("/api/auth/password", async (request, reply) => {
+    const user = await getCurrentUser(request);
+    if (!user) return unauthenticated(reply);
+    const input = passwordChangeSchema.parse(request.body);
+    if (!(await verifyPassword(user.passwordHash, input.currentPassword))) return reply.code(401).send({ error: "当前密码不正确" });
+    if (input.newPassword === input.currentPassword) return reply.code(422).send({ error: "新密码不能与当前密码相同" });
+    const sessionId = request.unsignCookie(request.cookies[sessionCookie] ?? "").value;
+    await store.transaction(async (state) => {
+      const target = state.users.find((candidate) => candidate.id === user.id);
+      if (!target) return;
+      target.passwordHash = await hashPassword(input.newPassword);
+      state.sessions = state.sessions.filter((session) => session.userId !== target.id || session.id === sessionId);
+      addAudit(state, user.id, "auth.password_changed", user.id, "密码已修改，其他会话已注销");
+    });
+    return reply.code(204).send();
+  });
+
+  app.post("/api/auth/2fa/provision", async (request, reply) => {
+    const user = await getCurrentUser(request);
+    if (!user) return unauthenticated(reply);
+    if (user.totpEnabled) return reply.code(409).send({ error: "两步验证已经开启" });
+    const secret = generateTotpSecret();
+    await store.transaction((state) => {
+      const target = state.users.find((candidate) => candidate.id === user.id);
+      if (!target) return;
+      target.totpSecret = secret;
+      target.totpEnabled = false;
+      addAudit(state, user.id, "auth.2fa.provisioned", user.id, "已生成两步验证密钥");
+    });
+    const url = otpauthUrl("MicoPanel", user.username, secret);
+    const qrDataUrl = await QRCode.toDataURL(url, { margin: 1, width: 240, errorCorrectionLevel: "M" });
+    return { secret, otpauthUrl: url, qrDataUrl };
+  });
+
+  app.post("/api/auth/2fa/enable", async (request, reply) => {
+    const user = await getCurrentUser(request);
+    if (!user) return unauthenticated(reply);
+    if (user.totpEnabled) return reply.code(409).send({ error: "两步验证已经开启" });
+    if (!user.totpSecret) return reply.code(409).send({ error: "请先生成两步验证密钥" });
+    const input = totpCodeSchema.parse(request.body);
+    if (!verifyTotp(user.totpSecret, input.code)) return reply.code(401).send({ error: "验证码不正确" });
+    const { codes, hashes } = generateRecoveryCodes();
+    await store.transaction((draft) => {
+      const target = draft.users.find((candidate) => candidate.id === user.id);
+      if (!target) return;
+      target.totpEnabled = true;
+      target.recoveryCodes = hashes;
+      addAudit(draft, user.id, "auth.2fa.enabled", user.id, "两步验证已开启");
+    });
+    return { recoveryCodes: codes, user: userPublic({ ...user, totpEnabled: true }) };
+  });
+
+  app.post("/api/auth/2fa/disable", async (request, reply) => {
+    const user = await getCurrentUser(request);
+    if (!user) return unauthenticated(reply);
+    if (!user.totpEnabled) return reply.code(409).send({ error: "两步验证尚未开启" });
+    const input = totpCodeSchema.parse(request.body);
+    const recoveryIndex = user.recoveryCodes ? recoveryCodeIndex(input.code, user.recoveryCodes) : -1;
+    const valid = recoveryIndex >= 0 || verifyTotp(user.totpSecret ?? "", input.code);
+    if (!valid) return reply.code(401).send({ error: "验证码不正确" });
+    await store.transaction((draft) => {
+      const target = draft.users.find((candidate) => candidate.id === user.id);
+      if (!target) return;
+      target.totpSecret = undefined;
+      target.totpEnabled = false;
+      target.recoveryCodes = undefined;
+      addAudit(draft, user.id, "auth.2fa.disabled", user.id, "两步验证已关闭");
+    });
+    return reply.code(204).send();
   });
 
   app.post("/api/auth/logout", async (request, reply) => {
@@ -709,8 +805,11 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
       }
       if (input.password) {
         target.passwordHash = await hashPassword(input.password);
+        target.totpSecret = undefined;
+        target.totpEnabled = false;
+        target.recoveryCodes = undefined;
         state.sessions = state.sessions.filter((session) => session.userId !== target.id);
-        addAudit(state, actor.id, "user.password_reset", target.id, "密码已由管理员重置，会话已注销");
+        addAudit(state, actor.id, "user.password_reset", target.id, "密码已由管理员重置，会话与两步验证已注销");
       }
       return target;
     });
