@@ -1133,6 +1133,15 @@ function InstanceTable({
   );
 }
 
+const nodeLoadLevel = (node: Node): "high" | "critical" | undefined => {
+  if (!node.usage) return undefined;
+  const cpu = node.usage.cpuPercent ?? 0;
+  const memoryPercent = node.usage.memoryLimitBytes ? (node.usage.memoryBytes / node.usage.memoryLimitBytes) * 100 : 0;
+  if (cpu >= 95 || memoryPercent >= 95) return "critical";
+  if (cpu >= 80 || memoryPercent >= 85) return "high";
+  return undefined;
+};
+
 function Nodes({ nodes, selectedId, onSelect, canViewMetrics, onNew, onDelete }: { nodes: Node[]; selectedId?: string; onSelect: (id: string) => void; canViewMetrics: boolean; onNew: () => void; onDelete: (node: Node) => void }) {
   return (
     <section className="panel nodes-panel">
@@ -1149,13 +1158,21 @@ function Nodes({ nodes, selectedId, onSelect, canViewMetrics, onNew, onDelete }:
       {nodes.length ? (
         <div className="node-list">
           {nodes.map((node) => (
-            <article className={`node-card ${selectedId === node.id ? "selected" : ""}`} key={node.id}>
+            <article className={`node-card ${selectedId === node.id ? "selected" : ""} ${nodeLoadLevel(node) ? `load-${nodeLoadLevel(node)}` : ""}`} key={node.id}>
               <div className="node-card-top">
                 <span className={`dot large ${node.online ? "online" : ""}`} />
                 <div>
                   <h4>{node.name}</h4>
                   <p>{node.online ? "Agent 已连接" : "等待 Agent 注册"}</p>
                 </div>
+                {nodeLoadLevel(node) && (
+                  <span
+                    className={`node-load ${nodeLoadLevel(node)}`}
+                    title={`CPU ${Math.round(node.usage?.cpuPercent ?? 0)}% · 内存 ${Math.round(node.usage?.memoryLimitBytes ? (node.usage.memoryBytes / node.usage.memoryLimitBytes) * 100 : 0)}%`}
+                  >
+                    {nodeLoadLevel(node) === "critical" ? "过载" : "高负载"}
+                  </span>
+                )}
                 <Status
                   value={node.online ? "在线" : "离线"}
                   status={node.online ? "running" : "offline"}
@@ -1718,6 +1735,9 @@ const auditLabels: Record<string, string> = {
   "auth.2fa.disabled": "关闭两步验证",
   "token.created": "创建 API 令牌",
   "token.revoked": "吊销 API 令牌",
+  "token.expired": "令牌到期失效",
+  "auth.login.failed": "登录失败",
+  "auth.2fa.failed": "两步验证失败",
   "user.created": "创建用户",
   "user.deleted": "删除用户",
   "user.password_reset": "重置用户密码",
@@ -1757,7 +1777,10 @@ const auditCategories: Array<{ label: string; actions: string[] }> = [
       "auth.2fa.enabled",
       "auth.2fa.disabled",
       "token.created",
-      "token.revoked"
+      "token.revoked",
+      "token.expired",
+      "auth.login.failed",
+      "auth.2fa.failed"
     ]
   },
   {
@@ -1812,6 +1835,8 @@ function Audit({
     action: string;
     target: string;
     detail?: string;
+    ip?: string;
+    userAgent?: string;
     createdAt: string;
   }>;
   allow: boolean;
@@ -1872,6 +1897,12 @@ function Audit({
                   <code>{event.action}</code> {event.target}
                   {event.detail ? ` · ${event.detail}` : ""}
                 </small>
+                {event.ip ? (
+                  <span className="audit-meta" title={event.userAgent ?? undefined}>
+                    {event.ip}
+                    {event.userAgent ? ` · ${event.userAgent.length > 60 ? `${event.userAgent.slice(0, 60)}…` : event.userAgent}` : ""}
+                  </span>
+                ) : null}
               </span>
               <time>{formatTime(event.createdAt)}</time>
             </div>
@@ -3397,6 +3428,14 @@ function InstanceModal({
   );
 }
 
+function TokenExpiryBadge({ expiresAt }: { expiresAt?: string }) {
+  if (!expiresAt) return <span className="token-expiry none">永久</span>;
+  const remaining = Math.ceil((new Date(expiresAt).getTime() - Date.now()) / 86_400_000);
+  if (remaining <= 0) return <span className="token-expiry expired">已过期</span>;
+  if (remaining <= 7) return <span className="token-expiry warn">剩余 {remaining} 天</span>;
+  return <span className="token-expiry ok">剩余 {remaining} 天</span>;
+}
+
 function SecurityDialog({
   user,
   onClose,
@@ -3511,6 +3550,7 @@ function SecurityDialog({
   };
   const [apiTokens, setApiTokens] = useState<ApiToken[]>([]);
   const [tokenName, setTokenName] = useState("");
+  const [tokenDays, setTokenDays] = useState(30);
   const [tokenBusy, setTokenBusy] = useState(false);
   const [createdToken, setCreatedToken] = useState<string>();
   const loadTokens = async () => {
@@ -3532,7 +3572,7 @@ function SecurityDialog({
     try {
       const result = await api<{ token: string }>("/api/tokens", {
         method: "POST",
-        body: JSON.stringify({ name }),
+        body: JSON.stringify(tokenDays > 0 ? { name, days: tokenDays } : { name }),
       });
       setCreatedToken(result.token);
       setTokenName("");
@@ -3749,7 +3789,7 @@ function SecurityDialog({
             </p>
             {createdToken && (
               <div className="token-created">
-                <span>新令牌已创建（仅显示一次）</span>
+                <span>新令牌已创建（仅显示一次）{tokenDays > 0 ? `，有效期 ${tokenDays} 天` : ""}</span>
                 <code>{createdToken}</code>
                 <button
                   className="button compact"
@@ -3780,6 +3820,19 @@ function SecurityDialog({
                   placeholder="例如：ci-deploy、备份脚本"
                 />
               </label>
+              <label>
+                有效期
+                <select
+                  value={tokenDays}
+                  onChange={(event) => setTokenDays(Number(event.target.value))}
+                >
+                  <option value={7}>7 天</option>
+                  <option value={30}>30 天</option>
+                  <option value={90}>90 天</option>
+                  <option value={365}>365 天</option>
+                  <option value={0}>永不过期</option>
+                </select>
+              </label>
               <button
                 className="button"
                 type="submit"
@@ -3801,8 +3854,10 @@ function SecurityDialog({
                         {token.lastUsedAt
                           ? ` · 最近使用 ${formatTime(token.lastUsedAt)}`
                           : " · 尚未使用"}
+                        {token.expiresAt ? ` · 到期 ${formatTime(token.expiresAt)}` : ""}
                       </small>
                     </span>
+                    <TokenExpiryBadge expiresAt={token.expiresAt} />
                     <button
                       className="icon-button danger"
                       title="吊销令牌"

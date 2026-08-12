@@ -57,8 +57,13 @@ export const canAccess = (state: PanelState, user: User, instance: InstanceRecor
   return Boolean(member?.permissions.includes(permission));
 };
 
-export const addAudit = (state: PanelState, actorId: string, action: string, target: string, detail?: string): AuditRecord => {
-  const record = { id: id(), actorId, action, target, detail, createdAt: now() };
+export interface AuditMeta {
+  ip?: string;
+  userAgent?: string;
+}
+
+export const addAudit = (state: PanelState, actorId: string, action: string, target: string, detail?: string, meta?: AuditMeta): AuditRecord => {
+  const record = { id: id(), actorId, action, target, detail, ip: meta?.ip, userAgent: meta?.userAgent, createdAt: now() };
   state.audits.unshift(record);
   state.audits = state.audits.slice(0, 2000);
   return record;

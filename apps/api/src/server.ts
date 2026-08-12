@@ -111,7 +111,8 @@ class RealtimeHub {
 }
 
 const bearerTokenPrefix = "mcp_";
-const tokenPublic = (record: ApiTokenRecord) => ({ id: record.id, name: record.name, createdAt: record.createdAt, lastUsedAt: record.lastUsedAt });
+const tokenPublic = (record: ApiTokenRecord) => ({ id: record.id, name: record.name, createdAt: record.createdAt, lastUsedAt: record.lastUsedAt, expiresAt: record.expiresAt });
+const requestMeta = (request: FastifyRequest): { ip?: string; userAgent?: string } => ({ ip: request.ip, userAgent: request.headers["user-agent"] as string | undefined });
 const userPublic = (user: User) => ({ id: user.id, username: user.username, role: user.role, createdAt: user.createdAt, twoFactorEnabled: Boolean(user.totpEnabled) });
 const unauthenticated = (reply: FastifyReply) => reply.code(401).send({ error: "需要登录后才能继续" });
 const forbidden = (reply: FastifyReply) => reply.code(403).send({ error: "没有执行此操作的权限" });
@@ -215,6 +216,15 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
       const state = await store.read();
       const record = state.apiTokens.find((candidate) => candidate.tokenHash === tokenHash);
       if (!record) return undefined;
+      if (record.expiresAt && new Date(record.expiresAt).getTime() <= Date.now()) {
+        void store.transaction((draft) => {
+          const index = draft.apiTokens.findIndex((candidate) => candidate.id === record.id);
+          if (index < 0) return;
+          const [expired] = draft.apiTokens.splice(index, 1);
+          addAudit(draft, expired.userId, "token.expired", expired.id, expired.name);
+        });
+        return undefined;
+      }
       void store.transaction((draft) => {
         const target = draft.apiTokens.find((candidate) => candidate.id === record.id);
         if (target) target.lastUsedAt = now();
@@ -646,7 +656,7 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
     const state = await store.read();
     const user = state.users.find((candidate) => candidate.username === input.username)!;
     await setSession(reply, user.id);
-    await store.transaction((draft) => addAudit(draft, user.id, "auth.bootstrap", user.id));
+    await store.transaction((draft) => addAudit(draft, user.id, "auth.bootstrap", user.id, undefined, requestMeta(request)));
     return { user: userPublic(user) };
   });
 
@@ -654,30 +664,36 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
     const input = loginSchema.parse(request.body);
     const state = await store.read();
     const user = state.users.find((candidate) => candidate.username.toLowerCase() === input.username.toLowerCase());
-    if (!user || !(await verifyPassword(user.passwordHash, input.password))) return reply.code(401).send({ error: "用户名或密码不正确" });
+    if (!user || !(await verifyPassword(user.passwordHash, input.password))) {
+      await store.transaction((draft) => addAudit(draft, "system", "auth.login.failed", user?.username ?? input.username, "用户名或密码不正确", requestMeta(request)));
+      return reply.code(401).send({ error: "用户名或密码不正确" });
+    }
     if (user.totpEnabled) {
       if (!input.code) {
-        await store.transaction((draft) => addAudit(draft, user.id, "auth.login.challenged", user.id, "等待两步验证"));
+        await store.transaction((draft) => addAudit(draft, user.id, "auth.login.challenged", user.id, "等待两步验证", requestMeta(request)));
         return { user: userPublic(user), twoFactorRequired: true };
       }
       const recoveryIndex = user.recoveryCodes ? recoveryCodeIndex(input.code, user.recoveryCodes) : -1;
       const valid = recoveryIndex >= 0 || verifyTotp(user.totpSecret ?? "", input.code);
-      if (!valid) return reply.code(401).send({ error: "两步验证码不正确" });
+      if (!valid) {
+        await store.transaction((draft) => addAudit(draft, user.id, "auth.2fa.failed", user.id, "两步验证码错误", requestMeta(request)));
+        return reply.code(401).send({ error: "两步验证码不正确" });
+      }
       if (recoveryIndex >= 0) {
         await store.transaction((draft) => {
           const target = draft.users.find((candidate) => candidate.id === user.id);
           if (!target?.recoveryCodes) return;
           target.recoveryCodes = target.recoveryCodes.filter((_, index) => index !== recoveryIndex);
-          addAudit(draft, user.id, "auth.login", user.id, "使用恢复码登录，恢复码已作废");
+          addAudit(draft, user.id, "auth.login", user.id, "使用恢复码登录，恢复码已作废", requestMeta(request));
         });
       } else {
-        await store.transaction((draft) => addAudit(draft, user.id, "auth.login", user.id, "两步验证通过"));
+        await store.transaction((draft) => addAudit(draft, user.id, "auth.login", user.id, "两步验证通过", requestMeta(request)));
       }
       await setSession(reply, user.id);
       return { user: userPublic(user) };
     }
     await setSession(reply, user.id);
-    await store.transaction((draft) => addAudit(draft, user.id, "auth.login", user.id));
+    await store.transaction((draft) => addAudit(draft, user.id, "auth.login", user.id, undefined, requestMeta(request)));
     return { user: userPublic(user) };
   });
 
@@ -693,7 +709,7 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
       if (!target) return;
       target.passwordHash = await hashPassword(input.newPassword);
       state.sessions = state.sessions.filter((session) => session.userId !== target.id || session.id === sessionId);
-      addAudit(state, user.id, "auth.password_changed", user.id, "密码已修改，其他会话已注销");
+      addAudit(state, user.id, "auth.password_changed", user.id, "密码已修改，其他会话已注销", requestMeta(request));
     });
     return reply.code(204).send();
   });
@@ -708,7 +724,7 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
       if (!target) return;
       target.totpSecret = secret;
       target.totpEnabled = false;
-      addAudit(state, user.id, "auth.2fa.provisioned", user.id, "已生成两步验证密钥");
+      addAudit(state, user.id, "auth.2fa.provisioned", user.id, "已生成两步验证密钥", requestMeta(request));
     });
     const url = otpauthUrl("MicoPanel", user.username, secret);
     const qrDataUrl = await QRCode.toDataURL(url, { margin: 1, width: 240, errorCorrectionLevel: "M" });
@@ -728,7 +744,7 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
       if (!target) return;
       target.totpEnabled = true;
       target.recoveryCodes = hashes;
-      addAudit(draft, user.id, "auth.2fa.enabled", user.id, "两步验证已开启");
+      addAudit(draft, user.id, "auth.2fa.enabled", user.id, "两步验证已开启", requestMeta(request));
     });
     return { recoveryCodes: codes, user: userPublic({ ...user, totpEnabled: true }) };
   });
@@ -747,28 +763,30 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
       target.totpSecret = undefined;
       target.totpEnabled = false;
       target.recoveryCodes = undefined;
-      addAudit(draft, user.id, "auth.2fa.disabled", user.id, "两步验证已关闭");
+      addAudit(draft, user.id, "auth.2fa.disabled", user.id, "两步验证已关闭", requestMeta(request));
     });
     return reply.code(204).send();
   });
 
-  const apiTokenSchema = z.object({ name: z.string().min(1).max(64) });
+  const apiTokenSchema = z.object({ name: z.string().min(1).max(64), days: z.number().int().min(1).max(3650).optional() });
 
   app.post("/api/tokens", async (request, reply) => {
     const user = await getCurrentUser(request);
     if (!user) return unauthenticated(reply);
     const input = apiTokenSchema.parse(request.body);
     const token = `${bearerTokenPrefix}${randomToken(32)}`;
+    const expiresAt = input.days ? new Date(Date.now() + input.days * 86_400_000).toISOString() : undefined;
     const record: ApiTokenRecord = {
       id: id(),
       userId: user.id,
       name: input.name,
       tokenHash: hashToken(token),
-      createdAt: now()
+      createdAt: now(),
+      expiresAt
     };
     await store.transaction((state) => {
       state.apiTokens.unshift(record);
-      addAudit(state, user.id, "token.created", record.id, input.name);
+      addAudit(state, user.id, "token.created", record.id, input.days ? `${input.name}（有效期 ${input.days} 天）` : input.name, requestMeta(request));
     });
     return reply.code(201).send({ token, apiToken: tokenPublic(record) });
   });
@@ -788,7 +806,7 @@ export async function buildServer(options?: { config?: AppConfig; store?: StateS
       const index = state.apiTokens.findIndex((record) => record.id === tokenId && record.userId === user.id);
       if (index < 0) return false;
       const [record] = state.apiTokens.splice(index, 1);
-      addAudit(state, user.id, "token.revoked", record.id, record.name);
+      addAudit(state, user.id, "token.revoked", record.id, record.name, requestMeta(request));
       return true;
     });
     if (!removed) return notFound(reply, "令牌不存在");

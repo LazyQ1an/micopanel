@@ -13,6 +13,7 @@ export interface ApiToken {
   name: string;
   createdAt: string;
   lastUsedAt?: string;
+  expiresAt?: string;
 }
 
 export interface Node {

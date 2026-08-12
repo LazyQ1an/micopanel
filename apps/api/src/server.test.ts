@@ -480,7 +480,12 @@ test("personal API tokens authenticate requests and revoke cleanly", async () =>
   const store = new MemoryStore();
   const app = await buildServer({ config: testConfig, store });
   try {
-    const bootstrap = await app.inject({ method: "POST", url: "/api/auth/bootstrap", ...json({ username: "root", password: "correct-password-123" }) });
+    const bootstrap = await app.inject({
+      method: "POST",
+      url: "/api/auth/bootstrap",
+      headers: { "content-type": "application/json", "user-agent": "mico-panel-tests/1.0" },
+      payload: JSON.stringify({ username: "root", password: "correct-password-123" })
+    });
     assert.equal(bootstrap.statusCode, 200);
     const cookie = String(bootstrap.headers["set-cookie"]).split(";")[0];
 
@@ -497,26 +502,75 @@ test("personal API tokens authenticate requests and revoke cleanly", async () =>
     // listing never exposes the stored hash
     const list = await app.inject({ method: "GET", url: "/api/tokens", headers: { cookie } });
     assert.equal(list.statusCode, 200);
-    const tokens = (list.json() as { apiTokens: Array<{ id: string; name: string; tokenHash?: string }> }).apiTokens;
+    let tokens = (list.json() as { apiTokens: Array<{ id: string; name: string; tokenHash?: string; expiresAt?: string }> }).apiTokens;
     assert.equal(tokens.length, 1);
     assert.equal(tokens[0].name, "ci-deploy");
     assert.equal(tokens[0].tokenHash, undefined);
+    assert.equal(tokens[0].expiresAt, undefined, "tokens without a validity period never expire");
+
+    // a token created with a validity period carries an expiresAt in the future
+    const shortLived = await app.inject({ method: "POST", url: "/api/tokens", headers: { cookie, "content-type": "application/json" }, payload: JSON.stringify({ name: "short-lived", days: 1 }) });
+    assert.equal(shortLived.statusCode, 201);
+    const shortToken = shortLived.json().apiToken as { expiresAt?: string };
+    assert.equal(typeof shortToken.expiresAt, "string");
+    assert.ok(new Date(shortToken.expiresAt!).getTime() > Date.now(), "one-day token expires in the future");
+
+    // nonsense validity periods are rejected
+    const badDays = await app.inject({ method: "POST", url: "/api/tokens", headers: { cookie, "content-type": "application/json" }, payload: JSON.stringify({ name: "bad-days", days: -1 }) });
+    assert.equal(badDays.statusCode, 422);
+    const zeroDays = await app.inject({ method: "POST", url: "/api/tokens", headers: { cookie, "content-type": "application/json" }, payload: JSON.stringify({ name: "zero-days", days: 0 }) });
+    assert.equal(zeroDays.statusCode, 422);
+
+    // an expired token is rejected and cleaned out of the store
+    const doomed = await app.inject({ method: "POST", url: "/api/tokens", headers: { cookie, "content-type": "application/json" }, payload: JSON.stringify({ name: "doomed", days: 1 }) });
+    assert.equal(doomed.statusCode, 201);
+    const doomedId = doomed.json().apiToken.id as string;
+    await store.transaction((state) => {
+      const target = state.apiTokens.find((candidate) => candidate.id === doomedId);
+      assert.ok(target, "doomed token exists in store");
+      target.expiresAt = new Date(Date.now() - 60_000).toISOString();
+    });
+    const expiredAttempt = await app.inject({ method: "GET", url: "/api/dashboard", headers: { authorization: `Bearer ${doomed.json().token as string}` } });
+    assert.equal(expiredAttempt.statusCode, 401, "expired tokens must be rejected");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    tokens = (await app.inject({ method: "GET", url: "/api/tokens", headers: { cookie } })).json().apiTokens as Array<{ id: string; name: string; tokenHash?: string; expiresAt?: string }>;
+    assert.equal(tokens.some((item) => item.name === "doomed"), false, "expired token record is swept from the store");
 
     // forged tokens are rejected
     const forged = await app.inject({ method: "GET", url: "/api/dashboard", headers: { authorization: "Bearer mcp_forged-token-value-123" } });
     assert.equal(forged.statusCode, 401);
 
     // revoking the token invalidates it immediately
-    const revoked = await app.inject({ method: "DELETE", url: `/api/tokens/${tokens[0].id}`, headers: { cookie } });
+    const ciDeploy = tokens.find((item) => item.name === "ci-deploy")!;
+    const revoked = await app.inject({ method: "DELETE", url: `/api/tokens/${ciDeploy.id}`, headers: { cookie } });
     assert.equal(revoked.statusCode, 204);
     const after = await app.inject({ method: "GET", url: "/api/dashboard", headers: { authorization: `Bearer ${token}` } });
     assert.equal(after.statusCode, 401);
 
     // the whole lifecycle is recorded in the audit trail
-    const audits = (await app.inject({ method: "GET", url: "/api/audit", headers: { cookie } })).json().audits as Array<{ action: string }>;
-    for (const action of ["token.created", "token.revoked"]) {
+    const audits = (await app.inject({ method: "GET", url: "/api/audit", headers: { cookie } })).json().audits as Array<{ action: string; detail?: string; ip?: string; userAgent?: string }>;
+    for (const action of ["token.created", "token.revoked", "token.expired"]) {
       assert.equal(audits.some((audit) => audit.action === action), true, `expected audit ${action}`);
     }
+
+    // failed password attempts are recorded with the probing username
+    await app.inject({
+      method: "POST",
+      url: "/api/auth/login",
+      headers: { "content-type": "application/json", "user-agent": "attacker-agent/2.0" },
+      payload: JSON.stringify({ username: "root", password: "wrong-password-999" })
+    });
+    const forensicAudits = (await app.inject({ method: "GET", url: "/api/audit", headers: { cookie } })).json().audits as Array<{ action: string; target: string; detail?: string; ip?: string; userAgent?: string }>;
+    const failedLogin = forensicAudits.find((audit) => audit.action === "auth.login.failed");
+    assert.ok(failedLogin, "failed password attempt is audited");
+    assert.equal(failedLogin!.target, "root");
+    assert.equal(failedLogin!.detail, "用户名或密码不正确");
+
+    // auth events carry request forensics (ip + user agent)
+    const bootstrapAudit = forensicAudits.find((audit) => audit.action === "auth.bootstrap");
+    assert.ok(bootstrapAudit, "bootstrap is audited");
+    assert.equal(bootstrapAudit!.ip, "127.0.0.1");
+    assert.equal(bootstrapAudit!.userAgent, "mico-panel-tests/1.0");
   } finally {
     await app.close();
     await rm(testConfig.ARTIFACTS_DIR, { recursive: true, force: true });

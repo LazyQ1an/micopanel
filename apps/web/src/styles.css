@@ -636,3 +636,88 @@ input:focus, select:focus, textarea:focus {
     transition-duration: .01ms !important;
   }
 }
+
+
+/* ============ design pass III: token expiry, audit forensics, node load ============ */
+/* ---- token create form: name full width, validity + button on second row ---- */
+.token-create {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+.token-create label:first-child {
+  grid-column: 1 / -1;
+}
+.token-create label select {
+  width: 100%;
+}
+
+/* ---- token expiry badges ---- */
+.token-expiry {
+  flex: 0 0 auto;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-family: "DM Mono", monospace;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .02em;
+  white-space: nowrap;
+}
+.token-expiry.ok {
+  color: var(--forest-2);
+  background: var(--mint-soft);
+}
+.token-expiry.warn {
+  color: #8a5a00;
+  background: var(--amber-soft);
+}
+.token-expiry.expired {
+  color: #9a2b2b;
+  background: var(--red-soft);
+}
+.token-expiry.none {
+  color: var(--muted);
+  background: var(--surface-soft);
+  border: 1px dashed var(--line);
+}
+
+/* ---- audit forensics: request ip + user agent ---- */
+.audit-meta {
+  display: inline-block;
+  margin-top: 3px;
+  max-width: 460px;
+  overflow: hidden;
+  color: #93a19a;
+  font-family: "DM Mono", monospace;
+  font-size: 10px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* ---- node load badges ---- */
+.node-load {
+  flex: 0 0 auto;
+  align-self: center;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .04em;
+}
+.node-load.high {
+  color: #8a5a00;
+  background: var(--amber-soft);
+}
+.node-load.critical {
+  color: #9a2b2b;
+  background: var(--red-soft);
+  animation: pulse-warn 1.8s var(--ease-out) infinite;
+}
+@keyframes pulse-warn {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(202, 91, 88, 0); }
+  50% { box-shadow: 0 0 0 5px rgba(202, 91, 88, .14); }
+}
+.node-card.load-high .util-bar i {
+  background: var(--amber);
+}
+.node-card.load-critical .util-bar i {
+  background: var(--red);
+}

@@ -114,6 +114,8 @@ export interface AuditRecord {
   action: string;
   target: string;
   detail?: string;
+  ip?: string;
+  userAgent?: string;
   createdAt: string;
 }
 
@@ -157,6 +159,7 @@ export interface ApiTokenRecord {
   tokenHash: string;
   createdAt: string;
   lastUsedAt?: string;
+  expiresAt?: string;
 }
 
 export interface PanelState {

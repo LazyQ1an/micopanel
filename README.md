@@ -113,6 +113,15 @@ Console commands, restores, and staged file transfers are intentionally not repl
 automatically because their effects cannot be proven safe to duplicate. An operator with the
 original operation permission can explicitly resubmit a failed task from the task view.
 
+## Personal API tokens
+
+Automation and CLI tooling authenticate to the control-plane API with personal tokens
+(`Authorization: Bearer mcp_...`). A token's plaintext is shown exactly once at creation;
+only its SHA-256 hash is stored. Tokens can be created with an explicit validity period
+(7/30/90/365 days or permanent from the UI). An expired token is rejected on use and is
+swept from the store, and the lifecycle is recorded in the audit log. Revoking a token
+invalidates it immediately.
+
 ## Security baseline
 
 - Browser sessions use signed, HttpOnly cookies.
@@ -130,3 +139,7 @@ original operation permission can explicitly resubmit a failed task from the tas
   when stored by the control plane.
 - Instance membership changes are owner/admin-only and are recorded in the audit log.
 - Every destructive or control operation is written to the audit log.
+- Authentication events carry request forensics: login, bootstrap, password change,
+  two-factor, and token events record the source IP and User-Agent. Failed password
+  attempts and failed 2FA codes are logged too, so brute-force probing is visible to
+  administrators instead of disappearing into the rate limiter.
