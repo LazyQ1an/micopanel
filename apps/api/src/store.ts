@@ -30,6 +30,9 @@ const normalizeState = (state: PanelState): PanelState => {
   state.artifacts ??= [];
   state.fileTransfers ??= [];
   state.apiTokens ??= [];
+  state.alertRules ??= [];
+  state.alertEvents ??= [];
+  state.notificationChannels ??= [];
   return state;
 };
 

@@ -4,7 +4,13 @@ import { getTemplate } from "./templates.js";
 import { Cron } from "croner";
 import { hashToken, id, randomToken } from "./security.js";
 import type {
+  AlertEvent,
+  AlertMetric,
+  AlertRule,
+  AlertScope,
+  AlertTargetSample,
   AuditRecord,
+  NotificationChannel,
   BackupRecord,
   InstanceMember,
   InstanceRecord,
@@ -16,6 +22,13 @@ import type {
   UserRole
 } from "./types.js";
 import type { StateStore } from "./store.js";
+
+const ALERT_METRIC_LABELS: Record<AlertMetric, string> = {
+  cpu: "CPU 使用率",
+  memory: "内存使用率",
+  disk: "磁盘使用率",
+  offline: "离线时长"
+};
 
 const now = (): string => new Date().toISOString();
 
@@ -282,3 +295,111 @@ export const newSchedule = (instanceId: string, input: { name: string; cron: str
 };
 
 export const roleForNewUser = (role: unknown): UserRole => role === "admin" ? "admin" : "user";
+
+export const alertMetricLabel = (metric: AlertMetric): string => ALERT_METRIC_LABELS[metric];
+
+export const ruleMatchesTarget = (rule: Pick<AlertRule, "scope" | "targetId">, target: Pick<AlertTargetSample, "scope" | "id">): boolean =>
+  rule.scope === target.scope && (!rule.targetId || rule.targetId === target.id);
+
+export const sampleMetricValue = (sample: AlertTargetSample, metric: AlertMetric): number | undefined => {
+  if (metric === "cpu") return sample.cpuPercent;
+  if (metric === "memory") return sample.memoryPercent;
+  if (metric === "disk") return sample.diskPercent;
+  if (metric === "offline") return sample.online ? 0 : sample.offlineSeconds;
+  return undefined;
+};
+
+/** 判断某个目标样本在一条规则下是否构成触发。离线路由使用样本的离线秒数，其余使用实时百分比。 */
+export const sampleBreachesRule = (rule: Pick<AlertRule, "metric" | "threshold">, sample: AlertTargetSample): boolean => {
+  if (rule.metric === "offline") {
+    if (sample.online) return false;
+    return (sample.offlineSeconds ?? 0) >= rule.threshold;
+  }
+  const value = sampleMetricValue(sample, rule.metric);
+  if (value === undefined) return false;
+  return value >= rule.threshold;
+};
+
+export const alertRulePublic = (rule: AlertRule) => ({ ...rule });
+export const channelPublic = ({ secret: _secret, ...channel }: NotificationChannel) => ({ ...channel, hasSecret: Boolean(_secret) });
+
+export const createAlertRule = (
+  state: PanelState,
+  actorId: string,
+  input: { name: string; scope: AlertScope; targetId?: string; metric: AlertMetric; threshold: number; level: "warning" | "critical"; channelIds: string[]; enabled?: boolean }
+): AlertRule => {
+  const rule: AlertRule = {
+    id: id(),
+    name: input.name.trim(),
+    scope: input.scope,
+    targetId: input.targetId || undefined,
+    metric: input.metric,
+    threshold: input.threshold,
+    level: input.level,
+    channelIds: [...new Set(input.channelIds)],
+    enabled: input.enabled ?? true,
+    createdAt: now(),
+    updatedAt: now()
+  };
+  state.alertRules.unshift(rule);
+  addAudit(state, actorId, "alert.rule.created", rule.id, `${rule.name} (${rule.scope}/${rule.metric}>=${rule.threshold})`);
+  return rule;
+};
+
+export const updateAlertRule = (
+  state: PanelState,
+  actorId: string,
+  ruleId: string,
+  input: { name?: string; targetId?: string; metric?: AlertMetric; threshold?: number; level?: "warning" | "critical"; channelIds?: string[]; enabled?: boolean }
+): AlertRule => {
+  const rule = state.alertRules.find((candidate) => candidate.id === ruleId);
+  if (!rule) throw new Error("告警规则不存在");
+  if (input.name !== undefined) rule.name = input.name.trim();
+  if (input.targetId !== undefined) rule.targetId = input.targetId || undefined;
+  if (input.metric !== undefined) rule.metric = input.metric;
+  if (input.threshold !== undefined) rule.threshold = input.threshold;
+  if (input.level !== undefined) rule.level = input.level;
+  if (input.channelIds !== undefined) rule.channelIds = [...new Set(input.channelIds)];
+  if (input.enabled !== undefined) rule.enabled = input.enabled;
+  rule.updatedAt = now();
+  addAudit(state, actorId, "alert.rule.updated", rule.id, rule.name);
+  return rule;
+};
+
+export const createNotificationChannel = (
+  state: PanelState,
+  actorId: string,
+  input: { name: string; type: NotificationChannel["type"]; url: string; secret?: string; enabled?: boolean }
+): NotificationChannel => {
+  const channel: NotificationChannel = {
+    id: id(),
+    name: input.name.trim(),
+    type: input.type,
+    url: input.url.trim(),
+    secret: input.secret?.trim() || undefined,
+    enabled: input.enabled ?? true,
+    createdAt: now(),
+    updatedAt: now()
+  };
+  state.notificationChannels.unshift(channel);
+  addAudit(state, actorId, "alert.channel.created", channel.id, channel.name);
+  return channel;
+};
+
+export const updateNotificationChannel = (
+  state: PanelState,
+  actorId: string,
+  channelId: string,
+  input: { name?: string; type?: NotificationChannel["type"]; url?: string; secret?: string; enabled?: boolean }
+): NotificationChannel => {
+  const channel = state.notificationChannels.find((candidate) => candidate.id === channelId);
+  if (!channel) throw new Error("通知渠道不存在");
+  if (input.name !== undefined) channel.name = input.name.trim();
+  if (input.type !== undefined) channel.type = input.type;
+  if (input.url !== undefined) channel.url = input.url.trim();
+  if (input.secret !== undefined) channel.secret = input.secret.trim() || undefined;
+  if (input.enabled !== undefined) channel.enabled = input.enabled;
+  channel.updatedAt = now();
+  addAudit(state, actorId, "alert.channel.updated", channel.id, channel.name);
+  return channel;
+};

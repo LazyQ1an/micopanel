@@ -152,6 +152,63 @@ export interface FileTransferRecord {
   error?: string;
 }
 
+export type AlertScope = "node" | "instance";
+export interface AlertTargetSample {
+  scope: AlertScope;
+  id: string;
+  name: string;
+  cpuPercent?: number;
+  memoryPercent?: number;
+  diskPercent?: number;
+  online: boolean;
+  offlineSeconds?: number;
+}
+export type AlertMetric = "cpu" | "memory" | "disk" | "offline";
+export type AlertLevel = "warning" | "critical";
+export type AlertStatus = "firing" | "resolved";
+export type NotificationChannelType = "webhook" | "dingtalk" | "wecom" | "serverchan";
+
+export interface AlertRule {
+  id: string;
+  name: string;
+  scope: AlertScope;
+  targetId?: string;
+  metric: AlertMetric;
+  threshold: number;
+  level: AlertLevel;
+  channelIds: string[];
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface NotificationChannel {
+  id: string;
+  name: string;
+  type: NotificationChannelType;
+  url: string;
+  secret?: string;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AlertEvent {
+  id: string;
+  ruleId: string;
+  ruleName: string;
+  scope: AlertScope;
+  targetId: string;
+  targetName: string;
+  metric: AlertMetric;
+  level: AlertLevel;
+  value: number;
+  threshold: number;
+  status: AlertStatus;
+  firedAt: string;
+  resolvedAt?: string;
+}
+
 export interface ApiTokenRecord {
   id: string;
   userId: string;
@@ -163,6 +220,9 @@ export interface ApiTokenRecord {
 }
 
 export interface PanelState {
+  alertRules: AlertRule[];
+  alertEvents: AlertEvent[];
+  notificationChannels: NotificationChannel[];
   users: User[];
   sessions: Session[];
   apiTokens: ApiTokenRecord[];
@@ -178,6 +238,9 @@ export interface PanelState {
 }
 
 export const createEmptyState = (): PanelState => ({
+  alertRules: [],
+  alertEvents: [],
+  notificationChannels: [],
   users: [],
   sessions: [],
   apiTokens: [],

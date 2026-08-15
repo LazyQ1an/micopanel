@@ -1,4 +1,4 @@
-import cookie from "@fastify/cookie";
+﻿import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
 import multipart from "@fastify/multipart";
 import rateLimit from "@fastify/rate-limit";
@@ -27,6 +27,15 @@ import { hashPassword, hashToken, id, randomToken, verifyPassword, verifyToken }
 import { generateRecoveryCodes, generateTotpSecret, otpauthUrl, recoveryCodeIndex, verifyRecoveryCode, verifyTotp } from "./totp.js";
 import {
   addAudit,
+  alertRulePublic,
+  channelPublic,
+  createAlertRule,
+  createNotificationChannel,
+  ruleMatchesTarget,
+  sampleBreachesRule,
+  sampleMetricValue,
+  updateAlertRule,
+  updateNotificationChannel,
   allPermissions,
   canAccess,
   createAdminIfNeeded,
@@ -52,7 +61,8 @@ import {
 } from "./service.js";
 import { createStore, type StateStore } from "./store.js";
 import { SERVER_TEMPLATES } from "./templates.js";
-import type { ApiTokenRecord, ArtifactRecord, BackupRecord, FileTransferRecord, InstanceRecord, ManagedFile, MetricPoint, NodeRecord, ScheduleRecord, TaskRecord, User } from "./types.js";
+import { buildAlertPayload, deliverNotification, TEST_ALERT_PAYLOAD, type AlertDeliverer } from "./notify.js";
+import type { AlertEvent, AlertRule, AlertTargetSample, ApiTokenRecord, ArtifactRecord, BackupRecord, FileTransferRecord, InstanceRecord, ManagedFile, MetricPoint, NodeRecord, NotificationChannel, ScheduleRecord, TaskRecord, User } from "./types.js";
 
 type SocketLike = {
   readyState: number;
@@ -183,7 +193,106 @@ const safeFilePath = (path: string): boolean => {
 const filePathSchema = z.object({ path: z.string().min(2).max(512).refine(safeFilePath, "文件路径无效") });
 const fileSchema = filePathSchema.extend({ content: z.string().max(10_000_000) });
 
-export async function buildServer(options?: { config?: AppConfig; store?: StateStore }) {
+
+const alertRuleSchema = z.object({
+  name: z.string().min(2).max(64),
+  scope: z.enum(["node", "instance"]),
+  targetId: z.union([z.string().uuid(), z.literal("")]).optional(),
+  metric: z.enum(["cpu", "memory", "disk", "offline"]),
+  threshold: z.number().min(1).max(604800),
+  level: z.enum(["warning", "critical"]),
+  channelIds: z.array(z.string().uuid()).default([]),
+  enabled: z.boolean().optional()
+});
+const alertRuleUpdateSchema = alertRuleSchema.partial();
+const channelSchema = z.object({
+  name: z.string().min(2).max(64),
+  type: z.enum(["webhook", "dingtalk", "wecom", "serverchan"]),
+  url: z.string().url().max(512),
+  secret: z.string().max(256).optional(),
+  enabled: z.boolean().optional()
+});
+const channelUpdateSchema = channelSchema.partial();
+
+export const evaluateAlerts = async (
+  store: StateStore,
+  samples: AlertTargetSample[],
+  deliver: AlertDeliverer,
+  broadcast: (event: UiEvent) => void
+): Promise<void> => {
+  if (!samples.length) return;
+  const state = await store.read();
+  const channelsById = new Map(state.notificationChannels.map((channel) => [channel.id, channel]));
+  const { notifications } = await store.transaction((draft) => {
+    const notifications: Array<{ channelIds: string[]; event: AlertEvent }> = [];
+    const firing = new Map<string, AlertEvent>();
+    for (const event of draft.alertEvents) {
+      if (event.status === "firing") firing.set(event.ruleId + ":" + event.targetId, event);
+    }
+    for (const rule of draft.alertRules) {
+      if (!rule.enabled) continue;
+      for (const sample of samples) {
+        if (!ruleMatchesTarget(rule, sample)) continue;
+        const key = rule.id + ":" + sample.id;
+        const current = firing.get(key);
+        if (sampleBreachesRule(rule, sample)) {
+          const value = sampleMetricValue(sample, rule.metric);
+          if (value === undefined) continue;
+          if (current) {
+            current.value = Math.max(current.value, value);
+            continue;
+          }
+          const event: AlertEvent = {
+            id: id(),
+            ruleId: rule.id,
+            ruleName: rule.name,
+            scope: rule.scope,
+            targetId: sample.id,
+            targetName: sample.name,
+            metric: rule.metric,
+            level: rule.level,
+            value,
+            threshold: rule.threshold,
+            status: "firing",
+            firedAt: now()
+          };
+          draft.alertEvents.unshift(event);
+          draft.alertEvents = draft.alertEvents.slice(0, 1000);
+          firing.set(key, event);
+          if (rule.channelIds.length) notifications.push({ channelIds: rule.channelIds, event });
+        } else if (current) {
+          current.status = "resolved";
+          current.resolvedAt = now();
+          if (rule.channelIds.length) notifications.push({ channelIds: rule.channelIds, event: current });
+        }
+      }
+    }
+    return { notifications };
+  });
+  for (const { channelIds, event } of notifications) {
+    for (const channelId of channelIds) {
+      const channel = channelsById.get(channelId);
+      if (!channel || !channel.enabled) continue;
+      const result = await deliver(channel, buildAlertPayload(event));
+      if (!result.ok) {
+        void store.transaction((draft) => {
+          addAudit(draft, "system", "alert.delivery.failed", channel.id, event.ruleName + " -> " + channel.name + (result.error ? ": " + result.error : ""));
+        });
+      }
+    }
+    broadcast({
+      type: "alert.updated",
+      eventId: event.id,
+      status: event.status,
+      level: event.level,
+      scope: event.scope,
+      targetId: event.targetId,
+      ruleName: event.ruleName
+    });
+  }
+};
+
+export async function buildServer(options?: { config?: AppConfig; store?: StateStore; deliver?: AlertDeliverer }) {
   const config = options?.config ?? loadConfig();
   const store = options?.store ?? createStore(config.DATABASE_URL);
   await store.init();

@@ -116,8 +116,13 @@ export interface NodeUsage {
   workloads?: WorkloadMetricSample;
 }
 
+export type AlertStatus = "firing" | "resolved";
+export type AlertScope = "node" | "instance";
+export type AlertLevel = "warning" | "critical";
+
 export type UiEvent =
   | { type: "node.updated"; nodeId: string; usage?: NodeUsage; online?: boolean }
   | { type: "instance.updated"; instanceId: string; status: InstanceSpec["status"] }
   | { type: "console.output"; instanceId: string; line: string }
-  | { type: "task.updated"; taskId: string; status: TaskStatus; message?: string; progress?: number; retryAt?: string; attempt?: number };
+  | { type: "task.updated"; taskId: string; status: TaskStatus; message?: string; progress?: number; retryAt?: string; attempt?: number }
+  | { type: "alert.updated"; eventId: string; status: AlertStatus; level: AlertLevel; scope: AlertScope; targetId: string; ruleName: string };
